@@ -16,7 +16,6 @@
 
 #include "common/hashfn.h"
 #include "executor/spi.h"
-#include "lib/dshash.h"
 #include "miscadmin.h"
 #include "optimizer/planner.h"
 #include "pgstat.h"
@@ -35,7 +34,7 @@
 PG_MODULE_MAGIC;
 
 #define PGSP_MAGIC				0x20210318
-#define PGSP_HTAB_KEY			UINT64CONST(1)
+#define PGSP_DATA_KEY			UINT64CONST(1)
 
 #define PGSP_LEVEL				DEBUG1
 
@@ -48,6 +47,7 @@ typedef struct pgspHashKey
 typedef struct pgspEntry
 {
 	pgspHashKey key;			/* hash key of entry - MUST BE FIRST */
+	slock_t		mutex;			/* protects the plan */
 	dsa_pointer plan;
 } pgspEntry;
 
@@ -59,7 +59,6 @@ typedef struct pgspSharedState
 	bool		init_done;
 	LWLock	   *lock;
 	dsm_handle h;
-	dshash_table_handle htab_handle;
 } pgspSharedState;
 
 /*---- Local variables ----*/
@@ -70,12 +69,14 @@ static planner_hook_type prev_planner_hook = NULL;
 
 /* Links to shared memory state */
 static pgspSharedState *pgsp = NULL;
+static HTAB *pgsp_hash = NULL;
+
+static bool pgsp_attached = false;
 
 static dsm_segment *seg = NULL;
 static shm_toc *toc = NULL;
 static void *dsa_space = NULL;
 static dsa_area *dsa = NULL;
-static dshash_table *htab = NULL;
 
 /*---- GUC variables ----*/
 
@@ -103,18 +104,8 @@ static PlannedStmt *pgsp_planner_hook(Query *parse,
 
 static void pgsp_detach(dsm_segment *segment, Datum datum);
 static void pgsp_init_dsm(void);
-static int pgsp_shared_table_compare(const void *a, const void *b, size_t size,
-							void *arg);
-static uint32 pgsp_shared_table_hash(const void *a, size_t size, void *arg);
-
-/* Parameters for the dshash table */
-static const dshash_parameters pgsp_table_params = {
-	sizeof(pgspHashKey),
-	sizeof(pgspEntry),
-	pgsp_shared_table_compare,
-	pgsp_shared_table_hash,
-	LWTRANCHE_PER_SESSION_DSA
-};
+static Size pgsp_memsize(void);
+static pgspEntry *pgsp_entry_alloc(pgspHashKey *key);
 
 
 /*
@@ -154,7 +145,7 @@ _PG_init(void)
 							1000,
 							100,
 							INT_MAX,
-							PGC_SIGHUP,
+							PGC_POSTMASTER,
 							0,
 							NULL,
 							NULL,
@@ -167,7 +158,7 @@ _PG_init(void)
 	 * the postmaster process.)  We'll allocate or attach to the shared
 	 * resources in pgsp_shmem_startup().
 	 */
-	RequestAddinShmemSpace(CACHELINEALIGN(sizeof(pgspSharedState)));
+	RequestAddinShmemSpace(pgsp_memsize());
 	RequestNamedLWLockTranche("pg_shared_plans", 1);
 
 	/* Install hooks */
@@ -252,14 +243,10 @@ pgsp_main(Datum main_arg)
 			size,
 			LWTRANCHE_PER_SESSION_DSA,
 			seg);
-	shm_toc_insert(toc, PGSP_HTAB_KEY, dsa_space);
+	shm_toc_insert(toc, PGSP_DATA_KEY, dsa_space);
 
 	dsm_pin_segment(seg);
 	dsa_pin_mapping(dsa);
-
-	/* Create the hash table of plans indexed by themselves. */
-	htab = dshash_create(dsa, &pgsp_table_params, dsa);
-	pgsp->htab_handle = dshash_get_hash_table_handle(htab);
 
 	MemoryContextSwitchTo(old_context);
 
@@ -289,12 +276,14 @@ static void
 pgsp_shmem_startup(void)
 {
 	bool				found;
+	HASHCTL		info;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
 
 	/* reset in case this is a restart within the postmaster */
 	pgsp = NULL;
+	pgsp_hash = NULL;
 
 	/*
 	 * Create or attach to the shared memory state, including hash table
@@ -311,6 +300,14 @@ pgsp_shmem_startup(void)
 		memset(pgsp, 0, sizeof(pgspSharedState));
 		pgsp->lock = &(GetNamedLWLockTranche("pg_shared_plans"))->lock;
 	}
+
+	info.keysize = sizeof(pgspHashKey);
+	info.entrysize = sizeof(pgspEntry);
+	pgsp_hash = ShmemInitHash("pg_shared_plans hash",
+							  pgsp_max, pgsp_max,
+							  &info,
+							  HASH_ELEM | HASH_BLOBS);
+
 	LWLockRelease(AddinShmemInitLock);
 }
 
@@ -324,59 +321,61 @@ pgsp_planner_hook(Query *parse,
 	PlannedStmt	   *result, *generic;
 	pgspHashKey		key;
 	pgspEntry	   *entry;
-	bool			found;
 
 	if (!pgsp_enabled)
-		return standard_planner(parse, query_string, cursorOptions,
-				boundParams);
+		goto fallback;
 
 	elog(PGSP_LEVEL, "plan");
 
 	if (parse->queryId == UINT64CONST(0))
 	{
 		elog(PGSP_LEVEL, "no queryid!");
-		return standard_planner(parse, query_string, cursorOptions,
-				boundParams);
+		goto fallback;
 	}
 
 	if (boundParams == NULL)
 	{
 		elog(PGSP_LEVEL, "no params!");
-		return standard_planner(parse, query_string, cursorOptions,
-				boundParams);
+		//goto fallback;
 	}
 
 	pgsp_init_dsm();
-
-	if (pgsp->htab_handle == 0)
-	{
-		elog(PGSP_LEVEL, "no htab_handle!");
-		return standard_planner(parse, query_string, cursorOptions,
-				boundParams);
-	}
-
-	if (htab == NULL)
-	{
-		elog(PGSP_LEVEL, "no htab!");
-		return standard_planner(parse, query_string, cursorOptions,
-				boundParams);
-	}
 
 	key.dbid = MyDatabaseId;
 	key.queryid = parse->queryId;
 
 	elog(PGSP_LEVEL, "looking for %d/%lu", key.dbid, key.queryid);
-	entry = dshash_find(htab, &key, false);
 
-	if (entry)
+	/* Lookup the hash table entry with shared lock. */
+	LWLockAcquire(pgsp->lock, LW_SHARED);
+	entry = (pgspEntry *) hash_search(pgsp_hash, &key, HASH_FIND, NULL);
+	LWLockRelease(pgsp->lock);
+
+	/* Create new entry, if not present */
+	if (!entry)
+	{
+		/* Need exclusive lock to make a new hashtable entry - promote */
+		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+
+		/* OK to create a new hashtable entry */
+		entry = pgsp_entry_alloc(&key);
+
+		LWLockRelease(pgsp->lock);
+	}
+
+	if (entry == NULL)
+	{
+		/* pgsp_entry_alloc complained about dealloc already */
+		goto fallback;
+	}
+
+	if (entry->plan != 0)
 	{
 		char *local = dsa_get_address(dsa, entry->plan);
 
 		elog(NOTICE, "found entry, bypassing planner");
 
 		result = (PlannedStmt *) stringToNode(local);
-
-		dshash_release_lock(htab, entry);
 
 		return result;
 	}
@@ -392,36 +391,45 @@ pgsp_planner_hook(Query *parse,
 
 	generic = standard_planner(generic_parse, query_string, cursorOptions, NULL);
 
-	if (entry == NULL)
+	Assert(entry);
+
+	if (entry->plan == 0)
 	{
-		entry = dshash_find_or_insert(htab,
-				&key,
-				&found);
+		volatile pgspEntry *e = (volatile pgspEntry *) entry;
+		char *local;
+		char *serialized;
+		size_t len;
 
-		if (!found)
+		serialized = nodeToString(generic);
+
+		len = strlen(serialized) + 1;
+
+		/*
+		 * Grab the spinlock while updating the plan
+		 */
+		SpinLockAcquire(&e->mutex);
+
+		if (e->plan == 0)
 		{
-			char *local;
-			char *serialized;
-			size_t len;
+			e->plan = dsa_allocate(dsa, len);
 
-			serialized = nodeToString(generic);
-
-			len = strlen(serialized) + 1;
-
-			entry->plan = dsa_allocate(dsa, len);
-
-			local = (char *) dsa_get_address(dsa, entry->plan);
+			local = (char *) dsa_get_address(dsa, e->plan);
 			/*
 			local->commandType = result->commandType;
 			local->queryId = result->queryId;
 			*/
 			memcpy(local, serialized, len);
 		}
-
-		dshash_release_lock(htab, entry);
+		SpinLockRelease(&e->mutex);
 	}
 
 	return result;
+
+fallback:
+	if (prev_planner_hook)
+		return (*prev_planner_hook) (parse, query_string, cursorOptions, boundParams);
+	else
+		return standard_planner(parse, query_string, cursorOptions, boundParams);
 }
 
 static void
@@ -437,13 +445,13 @@ pgsp_init_dsm(void)
 	MemoryContext old_context;
 	bool init_done;
 
-	/* Already alloced or attached */
-	if (htab != NULL)
-		return;
-
 	LWLockAcquire(pgsp->lock, LW_SHARED);
 	init_done = pgsp->init_done;
 	LWLockRelease(pgsp->lock);
+
+	/* already did the job */
+	if (pgsp_attached)
+		return;
 
 	/* bgworker didn't allocated the dsm yet, try next time. */
 	if (!init_done)
@@ -467,41 +475,63 @@ pgsp_init_dsm(void)
 	dsm_pin_mapping(seg);
 
 	toc = shm_toc_attach(PGSP_MAGIC, dsm_segment_address(seg));
-	dsa_space = shm_toc_lookup(toc, PGSP_HTAB_KEY, seg);
+	dsa_space = shm_toc_lookup(toc, PGSP_DATA_KEY, seg);
 	dsa = dsa_attach_in_place(dsa_space, seg);
 
 	dsa_pin_mapping(dsa);
 
-	htab = dshash_attach(dsa,
-			&pgsp_table_params,
-			pgsp->htab_handle,
-			dsa);
+	pgsp_attached = true;
+
 	MemoryContextSwitchTo(old_context);
 }
 
-static int
-pgsp_shared_table_compare(const void *a, const void *b, size_t size,
-							void *arg)
+/*
+ * Estimate shared memory space needed.
+ */
+static Size
+pgsp_memsize(void)
 {
-	pgspHashKey *k1 = (pgspHashKey *) a;
-	pgspHashKey *k2 = (pgspHashKey *) b;
+	Size		size;
 
-	if (k1->dbid == k2->dbid && k1->queryid == k2->queryid)
-		return 0;
-	else
-		return 1;
+	size = CACHELINEALIGN(sizeof(pgspSharedState));
+	size = add_size(size, hash_estimate_size(pgsp_max, sizeof(pgspEntry)));
+
+	return size;
 }
 
-static uint32
-pgsp_shared_table_hash(const void *a, size_t size, void *arg)
+/*
+ * Allocate a new hashtable entry.
+ * caller must hold an exclusive lock on pgsp->lock
+ */
+static pgspEntry *
+pgsp_entry_alloc(pgspHashKey *key)
 {
-	pgspHashKey *k = (pgspHashKey *) a;
-	uint32		h;
+	pgspEntry  *entry;
+	bool		found;
 
-	h = hash_combine(0, k->dbid);
-	h = hash_combine(h, k->queryid);
+	/* FIXME Need to write eviction code */
+	if (hash_get_num_entries(pgsp_hash) >= pgsp_max)
+	{
+		elog(WARNING, "FIXME");
+		return NULL;
+	}
 
-	return h;
+	/* Make space if needed */
+	//while (hash_get_num_entries(pgsp_hash) >= pgsp_max)
+	//	entry_dealloc();
+
+	/* Find or create an entry with desired hash code */
+	entry = (pgspEntry *) hash_search(pgsp_hash, key, HASH_ENTER, &found);
+
+	if (!found)
+	{
+		/* New entry, initialize it */
+		entry->plan = 0;
+		/* re-initialize the mutex each time ... we assume no one using it */
+		SpinLockInit(&entry->mutex);
+	}
+
+	return entry;
 }
 
 Datum
