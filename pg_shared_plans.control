@@ -1,0 +1,6 @@
+# pg_shared_plans extension
+comment = 'Shared plan cache for PostgreSQL'
+default_version = '0.0.1'
+requires = 'pg_stat_statements'
+module_pathname = '$libdir/pg_shared_plans'
+relocatable = true
