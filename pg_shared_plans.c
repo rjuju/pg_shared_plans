@@ -19,7 +19,6 @@
 #include "miscadmin.h"
 #include "optimizer/planner.h"
 #include "pgstat.h"
-#include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
@@ -49,6 +48,7 @@ typedef struct pgspEntry
 	pgspHashKey key;			/* hash key of entry - MUST BE FIRST */
 	slock_t		mutex;			/* protects the plan */
 	dsa_pointer plan;
+	dsm_handle  h;
 } pgspEntry;
 
 /*
@@ -71,12 +71,12 @@ static planner_hook_type prev_planner_hook = NULL;
 static pgspSharedState *pgsp = NULL;
 static HTAB *pgsp_hash = NULL;
 
-static bool pgsp_attached = false;
+//static bool pgsp_attached = false;
 
-static dsm_segment *seg = NULL;
-static shm_toc *toc = NULL;
-static void *dsa_space = NULL;
-static dsa_area *dsa = NULL;
+//static dsm_segment *seg = NULL;
+//static shm_toc *toc = NULL;
+//static void *dsa_space = NULL;
+//static dsa_area *dsa = NULL;
 
 /*---- GUC variables ----*/
 
@@ -90,11 +90,11 @@ PGDLLEXPORT void _PG_fini(void);
 
 PG_FUNCTION_INFO_V1(pg_shared_plans_reset);
 
-#if (PG_VERSION_NUM >= 90500)
-void pgsp_main(Datum main_arg) pg_attribute_noreturn();
-#else
-void pgsp_main(Datum main_arg) __attribute__((noreturn));
-#endif
+//#if (PG_VERSION_NUM >= 90500)
+//void pgsp_main(Datum main_arg) pg_attribute_noreturn();
+//#else
+//void pgsp_main(Datum main_arg) __attribute__((noreturn));
+//#endif
 
 static void pgsp_shmem_startup(void);
 static PlannedStmt *pgsp_planner_hook(Query *parse,
@@ -103,7 +103,6 @@ static PlannedStmt *pgsp_planner_hook(Query *parse,
 									  ParamListInfo boundParams);
 
 static void pgsp_detach(dsm_segment *segment, Datum datum);
-static void pgsp_init_dsm(void);
 static Size pgsp_memsize(void);
 static pgspEntry *pgsp_entry_alloc(pgspHashKey *key);
 
@@ -114,10 +113,6 @@ static pgspEntry *pgsp_entry_alloc(pgspHashKey *key);
 void
 _PG_init(void)
 {
-	BackgroundWorker worker;
-
-	elog(PGSP_LEVEL, "pg_init");
-
 	if (!process_shared_preload_libraries_in_progress)
 	{
 		elog(ERROR, "This module can only be loaded via shared_preload_libraries");
@@ -142,9 +137,17 @@ _PG_init(void)
 							"Sets the maximum number of plans tracked by pg_shared_plans.",
 							NULL,
 							&pgsp_max,
-							1000,
+							200,
 							100,
-							INT_MAX,
+							/*
+							 * FIXME: should allocate multiple plans per
+							 * segment, as there can only be
+							 * PG_DYNSHMEM_FIXED_SLOTS +
+							 *   PG_DYNSHMEM_SLOTS_PER_BACKEND * MaxBackends
+							 * segments.  Leave some room for the rest of
+							 * infrastructure using dsm segments.
+							 */
+							5 * MaxConnections,
 							PGC_POSTMASTER,
 							0,
 							NULL,
@@ -166,28 +169,6 @@ _PG_init(void)
 	shmem_startup_hook = pgsp_shmem_startup;
 	prev_planner_hook = planner_hook;
 	planner_hook = pgsp_planner_hook;
-
-	/*
-	 * Register the worker processes.
-	 * XXX didn't find another way to keep the mapping forever.
-	 */
-	memset(&worker, 0, sizeof(worker));
-	worker.bgw_flags =
-		BGWORKER_SHMEM_ACCESS;
-	worker.bgw_start_time = BgWorkerStart_ConsistentState;
-#if (PG_VERSION_NUM >= 100000)
-	snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_shared_plans");
-	snprintf(worker.bgw_function_name, BGW_MAXLEN, "pgsp_main");
-#else
-	worker.bgw_main = pgsp_main;
-#endif
-	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_shared_plans");
-	worker.bgw_restart_time = 10;
-	worker.bgw_main_arg = (Datum) 0;
-#if (PG_VERSION_NUM >= 90400)
-	worker.bgw_notify_pid = 0;
-#endif
-	RegisterBackgroundWorker(&worker);
 }
 
 void
@@ -199,76 +180,79 @@ _PG_fini(void)
 
 }
 
-void
-pgsp_main(Datum main_arg)
-{
-	MemoryContext old_context;
-	shm_toc_estimator estimator;
-	size_t size;
-
-	Assert(!pgsp->init_done);
-
-	BackgroundWorkerUnblockSignals();
-
-	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-
-	/* First time, alloc everything */
-	shm_toc_initialize_estimator(&estimator);
-	shm_toc_estimate_keys(&estimator, 1);
-	shm_toc_estimate_chunk(&estimator, pgsp_max * MAXALIGN(sizeof(pgspEntry)));
-	/* Let's plan for 100kB per plan */
-	shm_toc_estimate_chunk(&estimator, pgsp_max * 100 * 1024);
-
-	size = shm_toc_estimate(&estimator);
-	seg = dsm_create(size, DSM_CREATE_NULL_IF_MAXSEGMENTS);
-
-	if (seg == NULL)
-	{
-		elog(PGSP_LEVEL, "Too bad");
-		pgsp->init_done = true;
-		exit(0);
-	}
-
-	pgsp->h = dsm_segment_handle(seg);
-
-	old_context = MemoryContextSwitchTo(TopMemoryContext);
-	toc = shm_toc_create(PGSP_MAGIC,
-						 dsm_segment_address(seg),
-						 size);
-
-	size -= 1024;
-
-	dsa_space = shm_toc_allocate(toc, size);
-	dsa = dsa_create_in_place(dsa_space,
-			size,
-			LWTRANCHE_PER_SESSION_DSA,
-			seg);
-	shm_toc_insert(toc, PGSP_DATA_KEY, dsa_space);
-
-	dsm_pin_segment(seg);
-	dsa_pin_mapping(dsa);
-
-	MemoryContextSwitchTo(old_context);
-
-	on_dsm_detach(seg, pgsp_detach, (Datum) 0);
-
-	pgsp->init_done = true;
-	LWLockRelease(pgsp->lock);
-
-	/* And now sleep forever */
-	for (;;)
-	{
-		/* sleep */
-		WaitLatch(&MyProc->procLatch,
-				  WL_LATCH_SET | WL_POSTMASTER_DEATH,
-				  0
-#if PG_VERSION_NUM >= 100000
-				  ,PG_WAIT_EXTENSION
-#endif
-				  );
-		ResetLatch(&MyProc->procLatch);
-	}
-}
+//void
+//pgsp_main(Datum main_arg)
+//{
+//	MemoryContext old_context;
+//	shm_toc_estimator estimator;
+//	size_t size;
+//
+//	Assert(!pgsp->init_done);
+//
+//	BackgroundWorkerUnblockSignals();
+//
+//	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+//
+//	/* First time, alloc everything */
+//	shm_toc_initialize_estimator(&estimator);
+//	shm_toc_estimate_keys(&estimator, 1);
+//	shm_toc_estimate_chunk(&estimator, pgsp_max * MAXALIGN(sizeof(pgspEntry)));
+//	/* Let's plan for 100kB per plan */
+//	shm_toc_estimate_chunk(&estimator, pgsp_max * 100 * 1024);
+//
+//	size = shm_toc_estimate(&estimator);
+//	seg = dsm_create(size, DSM_CREATE_NULL_IF_MAXSEGMENTS);
+//
+//	if (seg == NULL)
+//	{
+//		elog(PGSP_LEVEL, "Too bad");
+//		pgsp->init_done = true;
+//		LWLockRelease(pgsp->lock);
+//		exit(0);
+//	}
+//
+//	dsm_pin_segment(seg);
+//
+//	pgsp->h = dsm_segment_handle(seg);
+//
+//	old_context = MemoryContextSwitchTo(TopMemoryContext);
+//	toc = shm_toc_create(PGSP_MAGIC,
+//						 dsm_segment_address(seg),
+//						 size);
+//
+//	size -= 1024;
+//
+//	dsa_space = shm_toc_allocate(toc, size);
+//	dsa = dsa_create_in_place(dsa_space,
+//			size,
+//			LWTRANCHE_PER_SESSION_DSA,
+//			seg);
+//	shm_toc_insert(toc, PGSP_DATA_KEY, dsa_space);
+//
+//	dsm_pin_segment(seg);
+//	dsa_pin_mapping(dsa);
+//
+//	MemoryContextSwitchTo(old_context);
+//
+//	on_dsm_detach(seg, pgsp_detach, (Datum) 0);
+//
+//	pgsp->init_done = true;
+//	LWLockRelease(pgsp->lock);
+//
+//	/* And now sleep forever */
+//	for (;;)
+//	{
+//		/* sleep */
+//		WaitLatch(&MyProc->procLatch,
+//				  WL_LATCH_SET | WL_POSTMASTER_DEATH,
+//				  0
+//#if PG_VERSION_NUM >= 100000
+//				  ,PG_WAIT_EXTENSION
+//#endif
+//				  );
+//		ResetLatch(&MyProc->procLatch);
+//	}
+//}
 /*
  * shmem_startup hook: allocate or attach to shared memory,
  */
@@ -321,6 +305,7 @@ pgsp_planner_hook(Query *parse,
 	PlannedStmt	   *result, *generic;
 	pgspHashKey		key;
 	pgspEntry	   *entry;
+	dsm_handle h = 0;
 
 	if (!pgsp_enabled)
 		goto fallback;
@@ -339,8 +324,6 @@ pgsp_planner_hook(Query *parse,
 		//goto fallback;
 	}
 
-	pgsp_init_dsm();
-
 	key.dbid = MyDatabaseId;
 	key.queryid = parse->queryId;
 
@@ -349,38 +332,52 @@ pgsp_planner_hook(Query *parse,
 	/* Lookup the hash table entry with shared lock. */
 	LWLockAcquire(pgsp->lock, LW_SHARED);
 	entry = (pgspEntry *) hash_search(pgsp_hash, &key, HASH_FIND, NULL);
-	LWLockRelease(pgsp->lock);
 
-	/* Create new entry, if not present */
-	if (!entry)
+	if (entry != NULL)
 	{
-		/* Need exclusive lock to make a new hashtable entry - promote */
-		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+		volatile pgspEntry *e = (volatile pgspEntry *) entry;
 
-		/* OK to create a new hashtable entry */
-		entry = pgsp_entry_alloc(&key);
-
-		LWLockRelease(pgsp->lock);
+		/*
+		 * Grab the spinlock to get the handle
+		 */
+		SpinLockAcquire(&e->mutex);
+		h = entry->h;
+		SpinLockRelease(&e->mutex);
 	}
 
-	if (entry == NULL)
+	if (h != DSM_HANDLE_INVALID)
 	{
-		/* pgsp_entry_alloc complained about dealloc already */
-		goto fallback;
-	}
+		dsm_segment *eseg;
+		shm_toc *etoc;
+		char *local;
 
-	if (entry->plan != 0)
-	{
-		char *local = dsa_get_address(dsa, entry->plan);
+		eseg = dsm_attach(h);
+		if (eseg == NULL)
+		{
+			LWLockRelease(pgsp->lock);
+			goto fallback;
+		}
 
-		elog(NOTICE, "found entry, bypassing planner");
+		etoc = shm_toc_attach(PGSP_MAGIC, dsm_segment_address(eseg));
 
-		result = (PlannedStmt *) stringToNode(local);
+		local = (char *) shm_toc_lookup(etoc, 0, true);
 
-		return result;
+		if (local != NULL)
+		{
+			elog(NOTICE, "found entry, bypassing planner");
+
+			result = (PlannedStmt *) stringToNode(local);
+			dsm_detach(eseg);
+
+			goto release;
+		}
+
+		dsm_detach(eseg);
 	}
 	else
 		elog(PGSP_LEVEL, "entry not found :(");
+
+	LWLockRelease(pgsp->lock);
 
 	generic_parse = copyObject(parse);
 
@@ -391,41 +388,77 @@ pgsp_planner_hook(Query *parse,
 
 	generic = standard_planner(generic_parse, query_string, cursorOptions, NULL);
 
-	Assert(entry);
-
-	if (entry->plan == 0)
+	/* Save the plan if no one did it yet */
+	if (!entry)
 	{
-		volatile pgspEntry *e = (volatile pgspEntry *) entry;
-		char *local;
+		volatile pgspEntry *e;
+		dsm_segment *eseg = NULL;
 		char *serialized;
-		size_t len;
+		size_t len, size;
+		shm_toc_estimator estimator;
 
 		serialized = nodeToString(generic);
-
 		len = strlen(serialized) + 1;
 
+		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+		entry = pgsp_entry_alloc(&key);
+
 		/*
-		 * Grab the spinlock while updating the plan
+		 * out of memory
 		 */
-		SpinLockAcquire(&e->mutex);
-
-		if (e->plan == 0)
+		if (entry == NULL)
 		{
-			e->plan = dsa_allocate(dsa, len);
-
-			local = (char *) dsa_get_address(dsa, e->plan);
-			/*
-			local->commandType = result->commandType;
-			local->queryId = result->queryId;
-			*/
-			memcpy(local, serialized, len);
+			elog(PGSP_LEVEL, "could not alloc entry");
+			goto release;
 		}
-		SpinLockRelease(&e->mutex);
+
+		e = (volatile pgspEntry *) entry;
+
+		shm_toc_initialize_estimator(&estimator);
+		shm_toc_estimate_keys(&estimator, 1);
+		shm_toc_estimate_chunk(&estimator, len);
+		shm_toc_estimate_chunk(&estimator, 200);
+		size = shm_toc_estimate(&estimator);
+
+		if (e->h == DSM_HANDLE_INVALID)
+		{
+			shm_toc *etoc;
+			char *local;
+
+			eseg = dsm_create(add_size(size, 2000), DSM_CREATE_NULL_IF_MAXSEGMENTS);
+	
+			/* out of memory */
+			if (eseg == NULL)
+			{
+				elog(PGSP_LEVEL, "out of mem");
+				goto release;
+			}
+
+			dsm_pin_segment(eseg);
+			on_dsm_detach(eseg, pgsp_detach, (Datum) 0);
+
+			e->h = dsm_segment_handle(eseg);
+			etoc = shm_toc_create(PGSP_MAGIC, dsm_segment_address(eseg), size);
+			size -= 200;
+			local = (char *) shm_toc_allocate(etoc, size);
+			memcpy(local, serialized, len);
+			shm_toc_insert(etoc, 0, local);
+			dsm_detach(eseg);
+		}
+		goto release;
 	}
 
+	goto finish;
+
+release:
+	Assert(LWLockHeldByMe(pgsp->lock));
+	LWLockRelease(pgsp->lock);
+finish:
+	Assert(!LWLockHeldByMe(pgsp->lock));
 	return result;
 
 fallback:
+	Assert(!LWLockHeldByMe(pgsp->lock));
 	if (prev_planner_hook)
 		return (*prev_planner_hook) (parse, query_string, cursorOptions, boundParams);
 	else
@@ -435,54 +468,7 @@ fallback:
 static void
 pgsp_detach(dsm_segment *segment, Datum datum)
 {
-	elog(WARNING, "pgsp_detach");
-}
-
-/* see GetSessionDsmHandle */
-static void
-pgsp_init_dsm(void)
-{
-	MemoryContext old_context;
-	bool init_done;
-
-	LWLockAcquire(pgsp->lock, LW_SHARED);
-	init_done = pgsp->init_done;
-	LWLockRelease(pgsp->lock);
-
-	/* already did the job */
-	if (pgsp_attached)
-		return;
-
-	/* bgworker didn't allocated the dsm yet, try next time. */
-	if (!init_done)
-		return;
-
-	/* We couldn't get the shm in the first place */
-	if (pgsp->h == 0)
-	{
-		elog(PGSP_LEVEL, "no h");
-		return;
-	}
-
-	old_context = MemoryContextSwitchTo(TopMemoryContext);
-	seg = dsm_attach(pgsp->h);
-	if (seg == 0)
-	{
-		elog(PGSP_LEVEL, "could not attach");
-		return;
-	}
-
-	dsm_pin_mapping(seg);
-
-	toc = shm_toc_attach(PGSP_MAGIC, dsm_segment_address(seg));
-	dsa_space = shm_toc_lookup(toc, PGSP_DATA_KEY, seg);
-	dsa = dsa_attach_in_place(dsa_space, seg);
-
-	dsa_pin_mapping(dsa);
-
-	pgsp_attached = true;
-
-	MemoryContextSwitchTo(old_context);
+	elog(PGSP_LEVEL, "pgsp_detach");
 }
 
 /*
@@ -509,6 +495,8 @@ pgsp_entry_alloc(pgspHashKey *key)
 	pgspEntry  *entry;
 	bool		found;
 
+	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
+
 	/* FIXME Need to write eviction code */
 	if (hash_get_num_entries(pgsp_hash) >= pgsp_max)
 	{
@@ -527,6 +515,7 @@ pgsp_entry_alloc(pgspHashKey *key)
 	{
 		/* New entry, initialize it */
 		entry->plan = 0;
+		entry->h = 0;
 		/* re-initialize the mutex each time ... we assume no one using it */
 		SpinLockInit(&entry->mutex);
 	}
