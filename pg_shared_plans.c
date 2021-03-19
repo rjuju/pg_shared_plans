@@ -177,7 +177,7 @@ _PG_init(void)
 							0,
 							INT_MAX,
 							PGC_SUSET,
-							0,
+							GUC_UNIT_MS,
 							NULL,
 							NULL,
 							NULL);
