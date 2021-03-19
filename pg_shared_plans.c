@@ -23,15 +23,19 @@
 #include "pgstat.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lmgr.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/shm_toc.h"
 #include "tcop/cmdtag.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+
+#include "pgsp_import.h"
 
 PG_MODULE_MAGIC;
 
@@ -106,6 +110,7 @@ static PlannedStmt *pgsp_planner_hook(Query *parse,
 static void pgsp_detach(dsm_segment *segment, Datum datum);
 static void pg_shared_plans_shutdown(Datum arg);
 
+static void pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire);
 static dsm_segment *pgsp_allocate_plan(PlannedStmt *stmt, size_t *len);
 static uint32 pgsp_hash_fn(const void *key, Size keysize);
 static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
@@ -309,6 +314,9 @@ pgsp_planner_hook(Query *parse,
 			dsm_detach(seg);
 
 			LWLockRelease(pgsp->lock);
+
+			pgsp_acquire_executor_locks(result, true);
+
 			return result;
 		}
 
@@ -375,6 +383,67 @@ pg_shared_plans_shutdown(Datum arg)
 {
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
 	LWLockRelease(pgsp->lock);
+}
+
+/*
+ * Acquire locks needed for execution of a cached plan;
+ * or release them if acquire is false.
+ *
+ * Based on AcquireExecutorLocks()
+ */
+static void
+pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire)
+{
+	ListCell   *lc2;
+	Index		rti,
+				resultRelation = 0;
+
+	if (plannedstmt->commandType == CMD_UTILITY)
+	{
+		/*
+		 * Ignore utility statements, except those (such as EXPLAIN) that
+		 * contain a parsed-but-not-planned query.  Note: it's okay to use
+		 * ScanQueryForLocks, even though the query hasn't been through
+		 * rule rewriting, because rewriting doesn't change the query
+		 * representation.
+		 */
+		Query	   *query = UtilityContainsQuery(plannedstmt->utilityStmt);
+
+		if (query)
+			pgsp_ScanQueryForLocks(query, acquire);
+		return;
+	}
+
+	rti = 1;
+	if (plannedstmt->resultRelations)
+		resultRelation = linitial_int(plannedstmt->resultRelations);
+	foreach(lc2, plannedstmt->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc2);
+
+		if (rte->rtekind != RTE_RELATION)
+			continue;
+
+		/*
+		 * Acquire the appropriate type of lock on each relation OID. Note
+		 * that we don't actually try to open the rel, and hence will not
+		 * fail if it's been dropped entirely --- we'll just transiently
+		 * acquire a non-conflicting lock.
+		 */
+		if (acquire)
+			LockRelationOid(rte->relid, rte->rellockmode);
+		else
+			UnlockRelationOid(rte->relid, rte->rellockmode);
+
+		/* Lock partitions ahead of modifying them in parallel mode. */
+		if (rti == resultRelation &&
+			plannedstmt->partitionOids != NIL)
+			pgsp_AcquireExecutorLocksOnPartitions(plannedstmt->partitionOids,
+												  rte->rellockmode, acquire);
+
+		rti++;
+	}
+
 }
 
 static dsm_segment *
@@ -849,9 +918,12 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 
 				if (local)
 				{
+					PlannedStmt *stmt = (PlannedStmt *) stringToNode(local);
+					pgsp_acquire_executor_locks(stmt, true);
 					ExplainBeginOutput(es);
-					ExplainOnePlan((PlannedStmt *)stringToNode(local),
+					ExplainOnePlan(stmt,
 							NULL, es, "", NULL, NULL, NULL, NULL);
+					pgsp_acquire_executor_locks(stmt, false);
 					values[i++] = CStringGetTextDatum(es->str->data);
 					//values[i++] = CStringGetTextDatum(local);
 				}

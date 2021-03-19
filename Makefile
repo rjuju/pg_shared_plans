@@ -11,7 +11,7 @@ PG_CONFIG ?= pg_config
 
 MODULE_big = pg_shared_plans
 
-OBJS = pg_shared_plans.o
+OBJS = pg_shared_plans.o pgsp_import.o
 
 all:
 
