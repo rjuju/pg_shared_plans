@@ -12,10 +12,11 @@
 
 
 #include "postgres.h"
-#include "fmgr.h"
 
 #include "common/hashfn.h"
 #include "executor/spi.h"
+#include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "optimizer/planner.h"
 #include "pgstat.h"
@@ -26,6 +27,7 @@
 #include "storage/shmem.h"
 #include "storage/shm_toc.h"
 #include "tcop/cmdtag.h"
+#include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -51,7 +53,9 @@ typedef struct pgspEntry
 {
 	pgspHashKey key;		/* hash key of entry - MUST BE FIRST */
 	dsm_handle  h;			/* Only modified holding exclusive pgsp->lock */
+	double		len;		/* serialized plan length */
 	slock_t		mutex;		/* protects following fields only */
+	int64		bypass;		/* number of times magic happened */
 	double		usage;		/* usage factor */
 } pgspEntry;
 
@@ -64,6 +68,7 @@ typedef struct pgspSharedState
 	double		cur_median_usage;	/* current median usage in hashtable */
 	slock_t		mutex;				/* protects following fields only */
 	int64		dealloc;			/* # of times entries were deallocated */
+	TimestampTz stats_reset;		/* timestamp with all stats reset */
 } pgspSharedState;
 
 /*---- Local variables ----*/
@@ -87,6 +92,8 @@ PGDLLEXPORT void _PG_init(void);
 PGDLLEXPORT void _PG_fini(void);
 
 PG_FUNCTION_INFO_V1(pg_shared_plans_reset);
+PG_FUNCTION_INFO_V1(pg_shared_plans_info);
+PG_FUNCTION_INFO_V1(pg_shared_plans);
 
 static void pgsp_shmem_startup(void);
 static PlannedStmt *pgsp_planner_hook(Query *parse,
@@ -94,14 +101,17 @@ static PlannedStmt *pgsp_planner_hook(Query *parse,
 									  int cursorOptions,
 									  ParamListInfo boundParams);
 
-static dsm_segment *pgsp_allocate_plan(PlannedStmt *stmt);
+static dsm_segment *pgsp_allocate_plan(PlannedStmt *stmt, size_t *len);
 static void pgsp_detach(dsm_segment *segment, Datum datum);
 static uint32 pgsp_hash_fn(const void *key, Size keysize);
 static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
 static Size pgsp_memsize(void);
-static pgspEntry *pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg);
+static pgspEntry *pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg,
+		size_t len);
 static void pgsp_entry_dealloc(void);
+static void pgsp_entry_remove(pgspEntry *entry);
 static int entry_cmp(const void *lhs, const void *rhs);
+static void pgsp_entry_reset(Oid dbid, uint64 queryid);
 
 
 /*
@@ -278,7 +288,15 @@ pgsp_planner_hook(Query *parse,
 
 		if (local != NULL)
 		{
+			/* Grab the spinlock while updating the counters. */
+			volatile pgspEntry *e = (volatile pgspEntry *) entry;
+
 			elog(NOTICE, "found entry, bypassing planner");
+
+			SpinLockAcquire(&e->mutex);
+			e->bypass += 1;
+			e->usage += e->len; /* should figure out something less stupid */
+			SpinLockRelease(&e->mutex);
 
 			result = (PlannedStmt *) stringToNode(local);
 			dsm_detach(seg);
@@ -308,12 +326,13 @@ pgsp_planner_hook(Query *parse,
 	if (!entry)
 	{
 		dsm_segment *seg;
+		size_t		len;
 
 		/*
 		 * We store the plan is dsm before acquiring the lwlock.  It means that
 		 * we may have to discard it, but it avoids locking overhead.
 		 */
-		seg = pgsp_allocate_plan(generic);
+		seg = pgsp_allocate_plan(generic, &len);
 
 		/*
 		 * Don't try to allocate a new entry if we couldn't store the plan in
@@ -323,7 +342,7 @@ pgsp_planner_hook(Query *parse,
 			return result;
 
 		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-		entry = pgsp_entry_alloc(&key, seg);
+		entry = pgsp_entry_alloc(&key, seg, len);
 		LWLockRelease(pgsp->lock);
 	}
 
@@ -339,21 +358,21 @@ fallback:
 }
 
 static dsm_segment *
-pgsp_allocate_plan(PlannedStmt *stmt)
+pgsp_allocate_plan(PlannedStmt *stmt, size_t *len)
 {
 	dsm_segment *seg;
 	shm_toc_estimator estimator;
 	shm_toc *toc;
 	char *local;
 	char *serialized;
-	size_t len, size;
+	size_t size;
 
 	serialized = nodeToString(stmt);
-	len = strlen(serialized) + 1;
+	*len = strlen(serialized) + 1;
 
 	shm_toc_initialize_estimator(&estimator);
 	shm_toc_estimate_keys(&estimator, 1);
-	shm_toc_estimate_chunk(&estimator, len);
+	shm_toc_estimate_chunk(&estimator, *len);
 	size = shm_toc_estimate(&estimator);
 
 	seg = dsm_create(size, DSM_CREATE_NULL_IF_MAXSEGMENTS);
@@ -366,8 +385,8 @@ pgsp_allocate_plan(PlannedStmt *stmt)
 	}
 
 	toc = shm_toc_create(PGSP_MAGIC, dsm_segment_address(seg), size);
-	local = (char *) shm_toc_allocate(toc, len);
-	memcpy(local, serialized, len);
+	local = (char *) shm_toc_allocate(toc, *len);
+	memcpy(local, serialized, *len);
 	shm_toc_insert(toc, PGSP_PLAN_KEY, local);
 
 	return seg;
@@ -424,7 +443,7 @@ pgsp_memsize(void)
  * caller must hold an exclusive lock on pgsp->lock
  */
 static pgspEntry *
-pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg)
+pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg, size_t len)
 {
 	pgspEntry  *entry;
 	bool		found;
@@ -441,6 +460,8 @@ pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg)
 	if (!found)
 	{
 		/* New entry, initialize it */
+		entry->len = len;
+		entry->bypass = 0;
 		entry->usage = PGSP_USAGE_INIT;
 
 		/* re-initialize the mutex each time ... we assume no one using it */
@@ -514,13 +535,7 @@ pgsp_entry_dealloc(void)
 	{
 		pgspEntry *entry = entries[i];
 
-		/* Free the dsm segment. */
-		dsm_segment *seg = dsm_attach(entry->h);
-		Assert(seg);
-		dsm_unpin_segment(entry->h);
-		dsm_detach(seg);
-		/* And remove the hash entry. */
-		hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
+		pgsp_entry_remove(entry);
 	}
 
 	pfree(entries);
@@ -533,6 +548,24 @@ pgsp_entry_dealloc(void)
 		s->dealloc += 1;
 		SpinLockRelease(&s->mutex);
 	}
+}
+
+/* Remove an entry from the hash table and deallocate dsm segment. */
+static void
+pgsp_entry_remove(pgspEntry *entry)
+{
+	dsm_segment *seg;
+
+	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
+
+	/* Free the dsm segment. */
+	seg = dsm_attach(entry->h);
+	Assert(seg);
+	dsm_unpin_segment(entry->h);
+	dsm_detach(seg);
+
+	/* And remove the hash entry. */
+	hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
 }
 
 /*
@@ -552,8 +585,242 @@ entry_cmp(const void *lhs, const void *rhs)
 		return 0;
 }
 
+/*
+ * Release entries corresponding to parameters passed.
+ */
+static void
+pgsp_entry_reset(Oid dbid, uint64 queryid)
+{
+	HASH_SEQ_STATUS hash_seq;
+	pgspEntry  *entry;
+	long		num_entries;
+	long		num_remove = 0;
+	pgspHashKey key;
+
+	if (!pgsp || !pgsp_hash)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_shared_plans must be loaded via shared_preload_libraries")));
+
+	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+	num_entries = hash_get_num_entries(pgsp_hash);
+
+	if (dbid != 0 && queryid != UINT64CONST(0))
+	{
+		/* If all the parameters are available, use the fast path. */
+		key.dbid = dbid;
+		key.queryid = queryid;
+
+		/* Remove the key if exists */
+		entry = (pgspEntry *) hash_search(pgsp_hash, &key, HASH_FIND, NULL);
+
+		if (entry)
+		{
+			pgsp_entry_remove(entry);
+			num_remove++;
+		}
+	}
+	else if (dbid != 0 || queryid != UINT64CONST(0))
+	{
+		/* Remove entries corresponding to valid parameters. */
+		hash_seq_init(&hash_seq, pgsp_hash);
+		while ((entry = hash_seq_search(&hash_seq)) != NULL)
+		{
+			if ((!dbid || entry->key.dbid == dbid) &&
+				(!queryid || entry->key.queryid == queryid))
+			{
+				pgsp_entry_remove(entry);
+				num_remove++;
+			}
+		}
+	}
+	else
+	{
+		/* Remove all entries. */
+		hash_seq_init(&hash_seq, pgsp_hash);
+		while ((entry = hash_seq_search(&hash_seq)) != NULL)
+		{
+			pgsp_entry_remove(entry);
+			num_remove++;
+		}
+	}
+
+	/* All entries are removed? */
+	if (num_entries == num_remove)
+	{
+		volatile pgspSharedState *s = (volatile pgspSharedState *) pgsp;
+
+		/*
+		 * Reset global statistics for pg_shared_plans since all entries are
+		 * removed.
+		 */
+		TimestampTz stats_reset = GetCurrentTimestamp();
+
+		SpinLockAcquire(&s->mutex);
+		s->dealloc = 0;
+		s->stats_reset = stats_reset;
+		SpinLockRelease(&s->mutex);
+	}
+
+	LWLockRelease(pgsp->lock);
+}
+
 Datum
 pg_shared_plans_reset(PG_FUNCTION_ARGS)
 {
+	Oid			dbid;
+	uint64		queryid;
+
+	dbid = PG_GETARG_OID(0);
+	queryid = (uint64) PG_GETARG_INT64(1);
+
+	pgsp_entry_reset(dbid, queryid);
+
 	PG_RETURN_VOID();
+}
+
+/* Number of output arguments (columns) for pg_shared_plans_info */
+#define PG_SHARED_PLANS_INFO_COLS	2
+
+/*
+ * Return statistics of pg_shared_plans.
+ */
+Datum
+pg_shared_plans_info(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[PG_SHARED_PLANS_INFO_COLS];
+	bool		nulls[PG_SHARED_PLANS_INFO_COLS];
+
+	if (!pgsp || !pgsp_hash)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_shared_plans must be loaded via shared_preload_libraries")));
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	MemSet(values, 0, sizeof(values));
+	MemSet(nulls, 0, sizeof(nulls));
+
+	/* Read global statistics for pg_shared_plans */
+	{
+		volatile pgspSharedState *s = (volatile pgspSharedState *) pgsp;
+
+		SpinLockAcquire(&s->mutex);
+		values[0] = Int64GetDatum(s->dealloc);
+		values[1] = TimestampTzGetDatum(s->stats_reset);
+		SpinLockRelease(&s->mutex);
+	}
+
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+#define PG_SHARED_PLANS_COLS			4
+Datum
+pg_shared_plans(PG_FUNCTION_ARGS)
+{
+	bool		showplan = PG_GETARG_BOOL(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	HASH_SEQ_STATUS hash_seq;
+	pgspEntry  *entry;
+
+	/* hash table must exist already */
+	if (!pgsp || !pgsp_hash)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_stat_statements must be loaded via shared_preload_libraries")));
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* Switch into long-lived context to construct returned data structures */
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * Get shared lock and iterate over the hashtable entries.
+	 *
+	 * With a large hash table, we might be holding the lock rather longer
+	 * than one could wish.  However, this only blocks creation of new hash
+	 * table entries, and the larger the hash table the less likely that is to
+	 * be needed.  So we can hope this is okay.  Perhaps someday we'll decide
+	 * we need to partition the hash table to limit the time spent holding any
+	 * one lock.
+	 */
+	LWLockAcquire(pgsp->lock, LW_SHARED);
+
+	hash_seq_init(&hash_seq, pgsp_hash);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		Datum		values[PG_SHARED_PLANS_COLS];
+		bool		nulls[PG_SHARED_PLANS_COLS];
+		int			i = 0;
+		int64		queryid = entry->key.queryid;
+		int64		bypass = entry->bypass;
+
+		memset(values, 0, sizeof(values));
+		memset(nulls, 0, sizeof(nulls));
+
+		values[i++] = ObjectIdGetDatum(entry->key.dbid);
+		values[i++] = Int64GetDatumFast(queryid);
+		values[i++] = Int64GetDatumFast(bypass);
+
+		if (showplan)
+		{
+			dsm_segment *seg;
+			shm_toc *toc;
+			char *local;
+
+			seg = dsm_attach(entry->h);
+			if (seg == NULL)
+				values[i++] = CStringGetTextDatum("<no dsm_segment>");
+			else
+			{
+				toc = shm_toc_attach(PGSP_MAGIC, dsm_segment_address(seg));
+				local = (char *) shm_toc_lookup(toc, PGSP_PLAN_KEY, true);
+
+				if (local)
+					values[i++] = CStringGetTextDatum(local);
+				else
+					values[i++] = CStringGetTextDatum("<no toc>");
+
+				dsm_detach(seg);
+			}
+		}
+		else
+			nulls[i++] = true;
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+	/* clean up and return the tuplestore */
+	LWLockRelease(pgsp->lock);
+
+	tuplestore_donestoring(tupstore);
+
+	return (Datum) 0;
 }
