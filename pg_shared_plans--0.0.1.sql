@@ -38,13 +38,26 @@ CREATE FUNCTION pg_shared_plans(IN showplan boolean,
     OUT bypass int8,
     OUT size int8,
     OUT plantime float8,
+    OUT total_custom_cost float8,
+    OUT num_custom_plans bigint,
+    OUT generic_cost float8,
     OUT plan text)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'pg_shared_plans'
 LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
 
 CREATE VIEW pg_shared_plans AS
-  SELECT DISTINCT pgss.query, pgsp.*
+  SELECT DISTINCT pgss.query,
+    pgsp.userid,
+    pgsp.dbid,
+    pgsp.queryid,
+    pgsp.bypass,
+    pg_size_pretty(pgsp.size) AS size,
+    pgsp.plantime,
+    pgsp.total_custom_cost / num_custom_plans AS avg_custom_cost,
+    pgsp.num_custom_plans,
+    pgsp.generic_cost,
+    pgsp.plan
   FROM pg_shared_plans(true) AS pgsp
   LEFT JOIN pg_stat_statements AS pgss USING (dbid, queryid);
 

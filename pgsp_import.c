@@ -12,6 +12,8 @@
 
 #include "postgres.h"
 
+#include "optimizer/optimizer.h"
+
 #include "pgsp_import.h"
 
 void
@@ -113,4 +115,52 @@ pgsp_ScanQueryWalker(Node *node, bool *acquire)
 	 */
 	return expression_tree_walker(node, pgsp_ScanQueryWalker,
 								  (void *) acquire);
+}
+
+/*
+ * cached_plan_cost: calculate estimated cost of a plan
+ *
+ * If include_planner is true, also include the estimated cost of constructing
+ * the plan.  (We must factor that into the cost of using a custom plan, but
+ * we don't count it for a generic plan.)
+ */
+double
+pgsp_cached_plan_cost(PlannedStmt *plannedstmt, bool include_planner)
+{
+	double		result = 0;
+
+	if (plannedstmt->commandType == CMD_UTILITY)
+		return result;			/* Ignore utility statements */
+
+	result += plannedstmt->planTree->total_cost;
+
+	if (include_planner)
+	{
+		/*
+		 * Currently we use a very crude estimate of planning effort based
+		 * on the number of relations in the finished plan's rangetable.
+		 * Join planning effort actually scales much worse than linearly
+		 * in the number of relations --- but only until the join collapse
+		 * limits kick in.  Also, while inheritance child relations surely
+		 * add to planning effort, they don't make the join situation
+		 * worse.  So the actual shape of the planning cost curve versus
+		 * number of relations isn't all that obvious.  It will take
+		 * considerable work to arrive at a less crude estimate, and for
+		 * now it's not clear that's worth doing.
+		 *
+		 * The other big difficulty here is that we don't have any very
+		 * good model of how planning cost compares to execution costs.
+		 * The current multiplier of 1000 * cpu_operator_cost is probably
+		 * on the low side, but we'll try this for awhile before making a
+		 * more aggressive correction.
+		 *
+		 * If we ever do write a more complicated estimator, it should
+		 * probably live in src/backend/optimizer/ not here.
+		 */
+		int			nrelations = list_length(plannedstmt->rtable);
+
+		result += 1000.0 * cpu_operator_cost * (nrelations + 1);
+	}
+
+	return result;
 }

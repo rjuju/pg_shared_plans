@@ -62,6 +62,9 @@ typedef struct pgspEntry
 	slock_t		mutex;		/* protects following fields only */
 	int64		bypass;		/* number of times magic happened */
 	double		usage;		/* usage factor */
+	Cost		total_custom_cost;
+	int64		num_custom_plans;
+	Cost		generic_cost;
 } pgspEntry;
 
 /*
@@ -130,7 +133,7 @@ static uint32 pgsp_hash_fn(const void *key, Size keysize);
 static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
 static Size pgsp_memsize(void);
 static pgspEntry *pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg,
-		size_t len, double plantime);
+		size_t len, double plantime, Cost custom_cost, Cost generic_cost);
 static void pgsp_entry_dealloc(void);
 static void pgsp_entry_remove(pgspEntry *entry);
 static int entry_cmp(const void *lhs, const void *rhs);
@@ -329,6 +332,7 @@ pgsp_planner_hook(Query *parse,
 	instr_time		planstart,
 					planduration;
 	double			plantime;
+	bool			accum_custom_stats = false;
 
 	if (!pgsp_enabled || parse->queryId == UINT64CONST(0) || boundParams == NULL)
 		goto fallback;
@@ -345,11 +349,12 @@ pgsp_planner_hook(Query *parse,
 	LWLockAcquire(pgsp->lock, LW_SHARED);
 	entry = (pgspEntry *) hash_search(pgsp_hash, &key, HASH_FIND, NULL);
 
-	if (entry && entry->h != DSM_HANDLE_INVALID)
+	if (entry)
 	{
 		dsm_segment *seg;
-		shm_toc *toc;
 		char *local;
+
+		Assert(entry->h != DSM_HANDLE_INVALID);
 
 		seg = dsm_attach(entry->h);
 		if (seg == NULL)
@@ -364,20 +369,49 @@ pgsp_planner_hook(Query *parse,
 		{
 			/* Grab the spinlock while updating the counters. */
 			volatile pgspEntry *e = (volatile pgspEntry *) entry;
+			bool				use_cached = false;
 
 			SpinLockAcquire(&e->mutex);
-			e->bypass += 1;
-			e->usage += e->plantime;
+
+			/* We should already have computed a custom plan */
+			Assert(e->generic_cost > 0);
+
+			if (e->num_custom_plans >= pgsp_threshold)
+			{
+				double				avg;
+
+				avg = e->total_custom_cost / e->num_custom_plans;
+				use_cached = (e->generic_cost < avg);
+
+				if (use_cached)
+				{
+					e->bypass += 1;
+					e->usage += e->plantime;
+				}
+			}
+			else
+			{
+				/* Increment usage so that it doesn't get evicted too soon */
+				e->usage += e->plantime;
+				accum_custom_stats = true;
+			}
 			SpinLockRelease(&e->mutex);
 
-			result = (PlannedStmt *) stringToNode(local);
-			dsm_detach(seg);
+			if (use_cached)
+			{
+				result = (PlannedStmt *) stringToNode(local);
 
-			LWLockRelease(pgsp->lock);
+				dsm_detach(seg);
+				LWLockRelease(pgsp->lock);
+				pgsp_acquire_executor_locks(result, true);
 
-			pgsp_acquire_executor_locks(result, true);
-
-			return result;
+				return result;
+			}
+		}
+		else
+		{
+			/* Should not happen. */
+			Assert(false);
 		}
 
 		dsm_detach(seg);
@@ -385,19 +419,23 @@ pgsp_planner_hook(Query *parse,
 
 	LWLockRelease(pgsp->lock);
 
-	generic_parse = copyObject(parse);
+	if (!entry)
+		generic_parse = copyObject(parse);
 
 	if (prev_planner_hook)
 		result = (*prev_planner_hook) (parse, query_string, cursorOptions, boundParams);
 	else
 		result = standard_planner(parse, query_string, cursorOptions, boundParams);
 
-	/* Also generate a generic plan, with its planning time */
-	INSTR_TIME_SET_CURRENT(planstart);
-	generic = standard_planner(generic_parse, query_string, cursorOptions, NULL);
-	INSTR_TIME_SET_CURRENT(planduration);
-	INSTR_TIME_SUBTRACT(planduration, planstart);
-	plantime = INSTR_TIME_GET_DOUBLE(planduration) * 1000.0;
+	if (!entry)
+	{
+		/* Also generate a generic plan, with its planning time */
+		INSTR_TIME_SET_CURRENT(planstart);
+		generic = standard_planner(generic_parse, query_string, cursorOptions, NULL);
+		INSTR_TIME_SET_CURRENT(planduration);
+		INSTR_TIME_SUBTRACT(planduration, planstart);
+		plantime = INSTR_TIME_GET_DOUBLE(planduration) * 1000.0;
+	}
 
 	/* Save the plan if no one did it yet */
 	if (!entry && plantime > pgsp_min_plantime)
@@ -419,8 +457,21 @@ pgsp_planner_hook(Query *parse,
 			return result;
 
 		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-		entry = pgsp_entry_alloc(&key, seg, len, plantime);
+		entry = pgsp_entry_alloc(&key, seg, len, plantime,
+								 pgsp_cached_plan_cost(result, true),
+								 pgsp_cached_plan_cost(generic, false));
 		LWLockRelease(pgsp->lock);
+	}
+	else if (accum_custom_stats)
+	{
+		volatile pgspEntry *e = (volatile pgspEntry *) entry;
+		Cost custom_cost = pgsp_cached_plan_cost(result, true);
+
+		SpinLockAcquire(&e->mutex);
+		Assert(e->num_custom_plans < pgsp_threshold);
+		e->total_custom_cost += custom_cost;
+		e->num_custom_plans += 1;
+		SpinLockRelease(&e->mutex);
 	}
 
 	Assert(!LWLockHeldByMe(pgsp->lock));
@@ -605,7 +656,7 @@ pgsp_memsize(void)
  */
 static pgspEntry *
 pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg, size_t len,
-		double plantime)
+		double plantime, Cost custom_cost, Cost generic_cost)
 {
 	pgspEntry  *entry;
 	bool		found;
@@ -626,6 +677,9 @@ pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg, size_t len,
 		entry->plantime = plantime;
 		entry->bypass = 0;
 		entry->usage = PGSP_USAGE_INIT;
+		entry->total_custom_cost = custom_cost;
+		entry->num_custom_plans = 1.0;
+		entry->generic_cost = generic_cost;
 
 		/* re-initialize the mutex each time ... we assume no one using it */
 		SpinLockInit(&entry->mutex);
@@ -874,7 +928,7 @@ pg_shared_plans_info(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
-#define PG_SHARED_PLANS_COLS			7
+#define PG_SHARED_PLANS_COLS			10
 Datum
 pg_shared_plans(PG_FUNCTION_ARGS)
 {
@@ -913,6 +967,12 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "size",
 						   INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "plantime",
+						   FLOAT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "total_custom_cost",
+						   FLOAT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "num_custom_plans",
+						   INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "generic_cost",
 						   FLOAT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "plans",
 						   TEXTOID, -1, 0);
@@ -956,13 +1016,27 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		Datum		values[PG_SHARED_PLANS_COLS];
 		bool		nulls[PG_SHARED_PLANS_COLS];
 		int			i = 0;
-		int64		queryid = entry->key.queryid;
-		int64		bypass = entry->bypass;
-		int64		len = entry->len;
-		double		plantime = entry->plantime;
+		volatile pgspEntry *e = (volatile pgspEntry *) entry;
+		int64		queryid;
+		int64		bypass;
+		int64		len;
+		double		plantime;
+		double		total_custom_cost;
+		int64		num_custom_plans;
+		double		generic_cost;
 
 		Assert(fctx->call_cntr < fctx->max_calls);
 		Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
+
+		SpinLockAcquire(&e->mutex);
+		queryid = entry->key.queryid;
+		bypass = entry->bypass;
+		len = entry->len;
+		plantime = entry->plantime;
+		total_custom_cost = entry-> total_custom_cost;
+		num_custom_plans = entry->num_custom_plans;
+		generic_cost = entry->generic_cost;
+		SpinLockRelease(&e->mutex);
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
@@ -976,6 +1050,9 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		values[i++] = Int64GetDatumFast(bypass);
 		values[i++] = Int64GetDatumFast(len);
 		values[i++] = Float8GetDatumFast(plantime);
+		values[i++] = Float8GetDatumFast(total_custom_cost);
+		values[i++] = Int64GetDatumFast(num_custom_plans);
+		values[i++] = Float8GetDatumFast(generic_cost);
 
 		if (showplan)
 		{
