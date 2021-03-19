@@ -125,6 +125,7 @@ static void pg_shared_plans_shutdown(Datum arg);
 
 static void pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire);
 static dsm_segment *pgsp_allocate_plan(PlannedStmt *stmt, size_t *len);
+static char *pgsp_get_plan(dsm_segment *seg);
 static uint32 pgsp_hash_fn(const void *key, Size keysize);
 static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
 static Size pgsp_memsize(void);
@@ -357,8 +358,7 @@ pgsp_planner_hook(Query *parse,
 			goto fallback;
 		}
 
-		toc = shm_toc_attach(PGSP_MAGIC, dsm_segment_address(seg));
-		local = (char *) shm_toc_lookup(toc, PGSP_PLAN_KEY, true);
+		local = pgsp_get_plan(seg);
 
 		if (local != NULL)
 		{
@@ -540,6 +540,19 @@ pgsp_allocate_plan(PlannedStmt *stmt, size_t *len)
 	shm_toc_insert(toc, PGSP_PLAN_KEY, local);
 
 	return seg;
+}
+
+static char *
+pgsp_get_plan(dsm_segment *seg)
+{
+	shm_toc *toc;
+
+	Assert(seg);
+
+	toc = shm_toc_attach(PGSP_MAGIC, dsm_segment_address(seg));
+	Assert(toc);
+
+	return (char *) shm_toc_lookup(toc, PGSP_PLAN_KEY, true);
 }
 
 /* Calculate a hash value for a given key. */
@@ -968,7 +981,6 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		{
 			ExplainState   *es = NewExplainState();
 			dsm_segment *seg;
-			shm_toc *toc;
 			char *local;
 
 			es->analyze = false;
@@ -985,8 +997,7 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 				values[i++] = CStringGetTextDatum("<no dsm_segment>");
 			else
 			{
-				toc = shm_toc_attach(PGSP_MAGIC, dsm_segment_address(seg));
-				local = (char *) shm_toc_lookup(toc, PGSP_PLAN_KEY, true);
+				local = pgsp_get_plan(seg);
 
 				if (local)
 				{
