@@ -46,8 +46,6 @@ PG_MODULE_MAGIC;
 #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every entry_dealloc */
 #define USAGE_DEALLOC_PERCENT	5		/* free this % of entries at once */
 
-#define PGSP_LEVEL				DEBUG1
-
 typedef struct pgspHashKey
 {
 	Oid			userid;		/* user OID is plans has RLS */
@@ -252,31 +250,16 @@ pgsp_planner_hook(Query *parse,
 	pgspHashKey		key;
 	pgspEntry	   *entry;
 
-	if (!pgsp_enabled)
+	if (!pgsp_enabled || parse->queryId == UINT64CONST(0) || boundParams == NULL)
 		goto fallback;
 
-	elog(PGSP_LEVEL, "plan");
-
-	if (parse->queryId == UINT64CONST(0))
-	{
-		elog(PGSP_LEVEL, "no queryid!");
-		goto fallback;
-	}
-
-	if (boundParams == NULL)
-	{
-		elog(PGSP_LEVEL, "no params!");
-		//goto fallback;
-	}
-
+	/* We need to create a per-user entry if there are RLS */
 	if (parse->hasRowSecurity)
 		key.userid = GetUserId();
 	else
 		key.userid = InvalidOid;
 	key.dbid = MyDatabaseId;
 	key.queryid = parse->queryId;
-
-	elog(PGSP_LEVEL, "looking for %d/%d/%lu", key.userid, key.dbid, key.queryid);
 
 	/* Lookup the hash table entry with shared lock. */
 	LWLockAcquire(pgsp->lock, LW_SHARED);
@@ -303,8 +286,6 @@ pgsp_planner_hook(Query *parse,
 			/* Grab the spinlock while updating the counters. */
 			volatile pgspEntry *e = (volatile pgspEntry *) entry;
 
-			elog(NOTICE, "found entry, bypassing planner");
-
 			SpinLockAcquire(&e->mutex);
 			e->bypass += 1;
 			e->usage += e->len; /* should figure out something less stupid */
@@ -322,8 +303,6 @@ pgsp_planner_hook(Query *parse,
 
 		dsm_detach(seg);
 	}
-	else
-		elog(PGSP_LEVEL, "entry not found :(");
 
 	LWLockRelease(pgsp->lock);
 
@@ -375,7 +354,7 @@ fallback:
 static void
 pgsp_detach(dsm_segment *segment, Datum datum)
 {
-	elog(PGSP_LEVEL, "pgsp_detach");
+	elog(DEBUG1, "pgsp_detach");
 }
 
 static void
@@ -469,7 +448,6 @@ pgsp_allocate_plan(PlannedStmt *stmt, size_t *len)
 	/* out of memory */
 	if (!seg)
 	{
-		elog(PGSP_LEVEL, "out of mem");
 		return NULL;
 	}
 
