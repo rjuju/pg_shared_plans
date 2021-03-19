@@ -102,8 +102,10 @@ static PlannedStmt *pgsp_planner_hook(Query *parse,
 									  int cursorOptions,
 									  ParamListInfo boundParams);
 
-static dsm_segment *pgsp_allocate_plan(PlannedStmt *stmt, size_t *len);
 static void pgsp_detach(dsm_segment *segment, Datum datum);
+static void pg_shared_plans_shutdown(Datum arg);
+
+static dsm_segment *pgsp_allocate_plan(PlannedStmt *stmt, size_t *len);
 static uint32 pgsp_hash_fn(const void *key, Size keysize);
 static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
 static Size pgsp_memsize(void);
@@ -361,6 +363,19 @@ fallback:
 		return standard_planner(parse, query_string, cursorOptions, boundParams);
 }
 
+static void
+pgsp_detach(dsm_segment *segment, Datum datum)
+{
+	elog(PGSP_LEVEL, "pgsp_detach");
+}
+
+static void
+pg_shared_plans_shutdown(Datum arg)
+{
+	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
+	LWLockRelease(pgsp->lock);
+}
+
 static dsm_segment *
 pgsp_allocate_plan(PlannedStmt *stmt, size_t *len)
 {
@@ -394,12 +409,6 @@ pgsp_allocate_plan(PlannedStmt *stmt, size_t *len)
 	shm_toc_insert(toc, PGSP_PLAN_KEY, local);
 
 	return seg;
-}
-
-static void
-pgsp_detach(dsm_segment *segment, Datum datum)
-{
-	elog(PGSP_LEVEL, "pgsp_detach");
 }
 
 /* Calculate a hash value for a given key. */
@@ -719,70 +728,89 @@ pg_shared_plans_info(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
-#define PG_SHARED_PLANS_COLS			4
+#define PG_SHARED_PLANS_COLS			5
 Datum
 pg_shared_plans(PG_FUNCTION_ARGS)
 {
+	struct
+	{
+		bool			showplan;
+		HASH_SEQ_STATUS hash_seq;
+	} *state;
 	bool		showplan = PG_GETARG_BOOL(0);
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	TupleDesc	tupdesc;
-	Tuplestorestate *tupstore;
-	MemoryContext per_query_ctx;
-	MemoryContext oldcontext;
-	HASH_SEQ_STATUS hash_seq;
+	FuncCallContext *fctx;
 	pgspEntry  *entry;
 
-	/* hash table must exist already */
-	if (!pgsp || !pgsp_hash)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("pg_stat_statements must be loaded via shared_preload_libraries")));
-
-	/* check to see if caller supports us returning a tuplestore */
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsinfo->allowedModes & SFRM_Materialize))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
-
-	/* Switch into long-lived context to construct returned data structures */
-	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-
-	/* Build a tuple descriptor for our result type */
-	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-		elog(ERROR, "return type must be a row type");
-
-	tupstore = tuplestore_begin_heap(true, false, work_mem);
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = tupstore;
-	rsinfo->setDesc = tupdesc;
-
-	MemoryContextSwitchTo(oldcontext);
-
-	/*
-	 * Get shared lock and iterate over the hashtable entries.
-	 *
-	 * With a large hash table, we might be holding the lock rather longer
-	 * than one could wish.  However, this only blocks creation of new hash
-	 * table entries, and the larger the hash table the less likely that is to
-	 * be needed.  So we can hope this is okay.  Perhaps someday we'll decide
-	 * we need to partition the hash table to limit the time spent holding any
-	 * one lock.
-	 */
-	LWLockAcquire(pgsp->lock, LW_SHARED);
-
-	hash_seq_init(&hash_seq, pgsp_hash);
-	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	if (SRF_IS_FIRSTCALL())
 	{
+		TupleDesc		tupdesc;
+		ReturnSetInfo *rsi = (ReturnSetInfo *) fcinfo->resultinfo;
+		MemoryContext	oldcontext;
+		int				i = 1;
+
+		/* create a function context for cross-call persistence */
+		fctx = SRF_FIRSTCALL_INIT();
+
+		oldcontext = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
+
+		/* build tupdesc for result tuples */
+		/* this had better match SQL definition in extension script */
+		tupdesc = CreateTemplateTupleDesc(PG_SHARED_PLANS_COLS);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "userid",
+						   OIDOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "dbid",
+						   OIDOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "queryid",
+						   INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "bypass",
+						   INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "plans",
+						   TEXTOID, -1, 0);
+
+		Assert(i == PG_SHARED_PLANS_COLS + 1);
+		fctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+		state = palloc(sizeof(*state));
+		state->showplan = PG_GETARG_BOOL(0);
+
+		MemoryContextSwitchTo(oldcontext);
+
+		fctx->max_calls = hash_get_num_entries(pgsp_hash);
+		fctx->user_fctx = state;
+
+		/*
+		 * Get shared lock and iterate over the hashtable entries.
+		 *
+		 * With a large hash table, we might be holding the lock rather longer
+		 * than one could wish.  However, this only blocks creation of new hash
+		 * table entries, and the larger the hash table the less likely that is
+		 * to be needed.  So we can hope this is okay.  Perhaps someday we'll
+		 * decide we need to partition the hash table to limit the time spent
+		 * holding any one lock.
+		 */
+		LWLockAcquire(pgsp->lock, LW_SHARED);
+
+		RegisterExprContextCallback(rsi->econtext,
+				pg_shared_plans_shutdown,
+				(Datum) 0);
+
+		hash_seq_init(&state->hash_seq, pgsp_hash);
+	}
+
+	fctx = SRF_PERCALL_SETUP();
+	state = fctx->user_fctx;
+
+	if ((entry = hash_seq_search(&state->hash_seq)) != NULL)
+	{
+		HeapTuple	tuple;
 		Datum		values[PG_SHARED_PLANS_COLS];
 		bool		nulls[PG_SHARED_PLANS_COLS];
 		int			i = 0;
 		int64		queryid = entry->key.queryid;
 		int64		bypass = entry->bypass;
+
+		Assert(fctx->call_cntr < fctx->max_calls);
+		Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
 
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
@@ -820,13 +848,11 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		else
 			nulls[i++] = true;
 
-		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+		tuple = heap_form_tuple(fctx->tuple_desc, values, nulls);
+		SRF_RETURN_NEXT(fctx, HeapTupleGetDatum(tuple));
 	}
 
-	/* clean up and return the tuplestore */
-	LWLockRelease(pgsp->lock);
+	/* LWLockRelease will be called in pg_shared_plans_shutdown(). */
 
-	tuplestore_donestoring(tupstore);
-
-	return (Datum) 0;
+	SRF_RETURN_DONE(fctx);
 }
