@@ -13,6 +13,7 @@
 
 #include "postgres.h"
 
+#include "commands/explain.h"
 #include "common/hashfn.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -825,9 +826,18 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 
 		if (showplan)
 		{
+			ExplainState   *es = NewExplainState();
 			dsm_segment *seg;
 			shm_toc *toc;
 			char *local;
+
+			es->analyze = false;
+			es->costs = false;
+			es->verbose = false;
+			es->buffers = false;
+			es->timing = false;
+			es->summary = false;
+			es->format = EXPLAIN_FORMAT_TEXT;
 
 			seg = dsm_attach(entry->h);
 			if (seg == NULL)
@@ -838,7 +848,13 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 				local = (char *) shm_toc_lookup(toc, PGSP_PLAN_KEY, true);
 
 				if (local)
-					values[i++] = CStringGetTextDatum(local);
+				{
+					ExplainBeginOutput(es);
+					ExplainOnePlan((PlannedStmt *)stringToNode(local),
+							NULL, es, "", NULL, NULL, NULL, NULL);
+					values[i++] = CStringGetTextDatum(es->str->data);
+					//values[i++] = CStringGetTextDatum(local);
+				}
 				else
 					values[i++] = CStringGetTextDatum("<no toc>");
 
