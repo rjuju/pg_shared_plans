@@ -20,7 +20,8 @@ CREATE VIEW pg_shared_plans_info AS
 
 GRANT SELECT ON pg_shared_plans_info TO PUBLIC;
 
-CREATE FUNCTION pg_shared_plans_reset(IN dbid Oid DEFAULT 0,
+CREATE FUNCTION pg_shared_plans_reset(IN userid Oid DEFAULT 0,
+    IN dbid Oid DEFAULT 0,
     IN queryid bigint DEFAULT 0
 )
 RETURNS void
@@ -28,9 +29,10 @@ AS 'MODULE_PATHNAME', 'pg_shared_plans_reset'
 LANGUAGE C STRICT PARALLEL SAFE;
 
 -- Don't want this to be available to non-superusers.
-REVOKE ALL ON FUNCTION pg_shared_plans_reset(Oid, bigint) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pg_shared_plans_reset(Oid, Oid, bigint) FROM PUBLIC;
 
 CREATE FUNCTION pg_shared_plans(IN showplan boolean,
+    OUT userid oid,
     OUT dbid oid,
     OUT queryid bigint,
     OUT bypass int8,

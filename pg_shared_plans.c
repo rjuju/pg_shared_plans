@@ -45,6 +45,7 @@ PG_MODULE_MAGIC;
 
 typedef struct pgspHashKey
 {
+	Oid			userid;		/* user OID is plans has RLS */
 	Oid			dbid;		/* database OID */
 	uint64		queryid;	/* query identifier */
 } pgspHashKey;
@@ -260,10 +261,14 @@ pgsp_planner_hook(Query *parse,
 		//goto fallback;
 	}
 
+	if (parse->hasRowSecurity)
+		key.userid = GetUserId();
+	else
+		key.userid = InvalidOid;
 	key.dbid = MyDatabaseId;
 	key.queryid = parse->queryId;
 
-	elog(PGSP_LEVEL, "looking for %d/%lu", key.dbid, key.queryid);
+	elog(PGSP_LEVEL, "looking for %d/%d/%lu", key.userid, key.dbid, key.queryid);
 
 	/* Lookup the hash table entry with shared lock. */
 	LWLockAcquire(pgsp->lock, LW_SHARED);
@@ -404,7 +409,8 @@ pgsp_hash_fn(const void *key, Size keysize)
 	const pgspHashKey *k = (const pgspHashKey *) key;
 	uint32 h;
 
-	h = hash_combine(0, k->dbid);
+	h = hash_combine(0, k->userid);
+	h = hash_combine(h, k->dbid);
 	h = hash_combine(h, k->queryid);
 
 	return h;
@@ -417,7 +423,10 @@ pgsp_match_fn(const void *key1, const void *key2, Size keysize)
 	const pgspHashKey *k1 = (const pgspHashKey *) key1;
 	const pgspHashKey *k2 = (const pgspHashKey *) key2;
 
-	if (k1->dbid == k2->dbid && k1->queryid == k2->queryid)
+	if (k1->userid == k2->userid
+		&& k1->dbid == k2->dbid
+		&& k1->queryid == k2->queryid
+	)
 		return 0;
 	else
 		return 1;
@@ -592,10 +601,12 @@ pg_shared_plans_reset(PG_FUNCTION_ARGS)
 	long		num_entries;
 	long		num_remove = 0;
 	pgspHashKey key;
+	Oid			userid;
 	Oid			dbid;
 	uint64		queryid;
 
-	dbid = PG_GETARG_OID(0);
+	userid = PG_GETARG_OID(0);
+	dbid = PG_GETARG_OID(1);
 	queryid = (uint64) PG_GETARG_INT64(1);
 
 	if (!pgsp || !pgsp_hash)
@@ -606,9 +617,10 @@ pg_shared_plans_reset(PG_FUNCTION_ARGS)
 	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
 	num_entries = hash_get_num_entries(pgsp_hash);
 
-	if (dbid != 0 && queryid != UINT64CONST(0))
+	if (userid != 0 && dbid != 0 && queryid != UINT64CONST(0))
 	{
 		/* If all the parameters are available, use the fast path. */
+		key.userid = userid;
 		key.dbid = dbid;
 		key.queryid = queryid;
 
@@ -621,13 +633,14 @@ pg_shared_plans_reset(PG_FUNCTION_ARGS)
 			num_remove++;
 		}
 	}
-	else if (dbid != 0 || queryid != UINT64CONST(0))
+	else if (dbid != 0 || dbid != 0 || queryid != UINT64CONST(0))
 	{
 		/* Remove entries corresponding to valid parameters. */
 		hash_seq_init(&hash_seq, pgsp_hash);
 		while ((entry = hash_seq_search(&hash_seq)) != NULL)
 		{
-			if ((!dbid || entry->key.dbid == dbid) &&
+			if ((!userid || entry->key.userid == userid) &&
+				(!dbid || entry->key.dbid == dbid) &&
 				(!queryid || entry->key.queryid == queryid))
 			{
 				pgsp_entry_remove(entry);
@@ -774,6 +787,10 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		memset(values, 0, sizeof(values));
 		memset(nulls, 0, sizeof(nulls));
 
+		if (OidIsValid(entry->key.userid))
+			values[i++] = ObjectIdGetDatum(entry->key.userid);
+		else
+			nulls[i++] = true;
 		values[i++] = ObjectIdGetDatum(entry->key.dbid);
 		values[i++] = Int64GetDatumFast(queryid);
 		values[i++] = Int64GetDatumFast(bypass);
