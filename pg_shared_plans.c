@@ -69,13 +69,6 @@ static planner_hook_type prev_planner_hook = NULL;
 static pgspSharedState *pgsp = NULL;
 static HTAB *pgsp_hash = NULL;
 
-//static bool pgsp_attached = false;
-
-//static dsm_segment *seg = NULL;
-//static shm_toc *toc = NULL;
-//static void *dsa_space = NULL;
-//static dsa_area *dsa = NULL;
-
 /*---- GUC variables ----*/
 
 static bool pgsp_enabled = true;
@@ -319,10 +312,9 @@ pgsp_planner_hook(Query *parse,
 		shm_toc_initialize_estimator(&estimator);
 		shm_toc_estimate_keys(&estimator, 1);
 		shm_toc_estimate_chunk(&estimator, len);
-		shm_toc_estimate_chunk(&estimator, 200);
 		size = shm_toc_estimate(&estimator);
 
-		seg = dsm_create(add_size(size, 2000), DSM_CREATE_NULL_IF_MAXSEGMENTS);
+		seg = dsm_create(size, DSM_CREATE_NULL_IF_MAXSEGMENTS);
 
 		/* out of memory */
 		if (seg == NULL)
@@ -333,8 +325,7 @@ pgsp_planner_hook(Query *parse,
 
 		h = dsm_segment_handle(seg);
 		toc = shm_toc_create(PGSP_MAGIC, dsm_segment_address(seg), size);
-		size -= 200;
-		local = (char *) shm_toc_allocate(toc, size);
+		local = (char *) shm_toc_allocate(toc, len);
 		memcpy(local, serialized, len);
 		shm_toc_insert(toc, 0, local);
 
