@@ -111,7 +111,6 @@ static pgspEntry *pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg,
 static void pgsp_entry_dealloc(void);
 static void pgsp_entry_remove(pgspEntry *entry);
 static int entry_cmp(const void *lhs, const void *rhs);
-static void pgsp_entry_reset(Oid dbid, uint64 queryid);
 
 
 /*
@@ -585,17 +584,19 @@ entry_cmp(const void *lhs, const void *rhs)
 		return 0;
 }
 
-/*
- * Release entries corresponding to parameters passed.
- */
-static void
-pgsp_entry_reset(Oid dbid, uint64 queryid)
+Datum
+pg_shared_plans_reset(PG_FUNCTION_ARGS)
 {
 	HASH_SEQ_STATUS hash_seq;
 	pgspEntry  *entry;
 	long		num_entries;
 	long		num_remove = 0;
 	pgspHashKey key;
+	Oid			dbid;
+	uint64		queryid;
+
+	dbid = PG_GETARG_OID(0);
+	queryid = (uint64) PG_GETARG_INT64(1);
 
 	if (!pgsp || !pgsp_hash)
 		ereport(ERROR,
@@ -663,18 +664,6 @@ pgsp_entry_reset(Oid dbid, uint64 queryid)
 	}
 
 	LWLockRelease(pgsp->lock);
-}
-
-Datum
-pg_shared_plans_reset(PG_FUNCTION_ARGS)
-{
-	Oid			dbid;
-	uint64		queryid;
-
-	dbid = PG_GETARG_OID(0);
-	queryid = (uint64) PG_GETARG_INT64(1);
-
-	pgsp_entry_reset(dbid, queryid);
 
 	PG_RETURN_VOID();
 }
