@@ -88,9 +88,22 @@ static HTAB *pgsp_hash = NULL;
 
 /*---- GUC variables ----*/
 
-static bool pgsp_enabled = true;
-static int	pgsp_max = 1000;
-static int	pgsp_min_plantime = 10;
+static bool pgsp_enabled;
+static int	pgsp_max;
+static int	pgsp_min_plantime;
+static int	pgsp_threshold;
+static bool pgsp_es_costs;
+static int	pgsp_es_format;
+static bool pgsp_es_verbose;
+
+static const struct config_enum_entry pgsp_explain_format_options[] =
+{
+	{"text", EXPLAIN_FORMAT_TEXT, false},
+	{"json", EXPLAIN_FORMAT_JSON, false},
+	{"xml", EXPLAIN_FORMAT_XML, false},
+	{"yaml", EXPLAIN_FORMAT_YAML, false},
+	{NULL, 0, false},
+};
 
 /*---- Function declarations ----*/
 
@@ -181,6 +194,54 @@ _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
+
+	DefineCustomIntVariable("pg_shared_plans.threshold",
+							"Minimum number of custom plans to generate before maybe choosing cached plans.",
+							NULL,
+							&pgsp_threshold,
+							5,
+							0,
+							INT_MAX,
+							PGC_SUSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomBoolVariable("pg_shared_plans.explain_costs",
+							 "Display plans with COST option.",
+							 NULL,
+							 &pgsp_es_costs,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+
+	DefineCustomEnumVariable("pg_shared_plans.explain_format",
+							 "Display plans with FORMAT option.",
+							 NULL,
+							 &pgsp_es_format,
+							 EXPLAIN_FORMAT_TEXT,
+							 pgsp_explain_format_options,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("pg_shared_plans.explain_verbose",
+							 "Display plans with VERBOSE option.",
+							 NULL,
+							 &pgsp_es_verbose,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 
 	EmitWarningsOnPlaceholders("pg_shared_plans");
 
@@ -911,12 +972,13 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 			char *local;
 
 			es->analyze = false;
-			es->costs = false;
-			es->verbose = false;
+			es->costs = pgsp_es_costs;
+			es->verbose = pgsp_es_verbose;
 			es->buffers = false;
+			es->wal = false;
 			es->timing = false;
 			es->summary = false;
-			es->format = EXPLAIN_FORMAT_TEXT;
+			es->format = pgsp_es_format;
 
 			seg = dsm_attach(entry->h);
 			if (seg == NULL)
