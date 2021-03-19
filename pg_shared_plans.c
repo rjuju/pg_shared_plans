@@ -88,12 +88,6 @@ PGDLLEXPORT void _PG_fini(void);
 
 PG_FUNCTION_INFO_V1(pg_shared_plans_reset);
 
-//#if (PG_VERSION_NUM >= 90500)
-//void pgsp_main(Datum main_arg) pg_attribute_noreturn();
-//#else
-//void pgsp_main(Datum main_arg) __attribute__((noreturn));
-//#endif
-
 static void pgsp_shmem_startup(void);
 static PlannedStmt *pgsp_planner_hook(Query *parse,
 									  const char *query_string,
@@ -180,79 +174,6 @@ _PG_fini(void)
 
 }
 
-//void
-//pgsp_main(Datum main_arg)
-//{
-//	MemoryContext old_context;
-//	shm_toc_estimator estimator;
-//	size_t size;
-//
-//	Assert(!pgsp->init_done);
-//
-//	BackgroundWorkerUnblockSignals();
-//
-//	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-//
-//	/* First time, alloc everything */
-//	shm_toc_initialize_estimator(&estimator);
-//	shm_toc_estimate_keys(&estimator, 1);
-//	shm_toc_estimate_chunk(&estimator, pgsp_max * MAXALIGN(sizeof(pgspEntry)));
-//	/* Let's plan for 100kB per plan */
-//	shm_toc_estimate_chunk(&estimator, pgsp_max * 100 * 1024);
-//
-//	size = shm_toc_estimate(&estimator);
-//	seg = dsm_create(size, DSM_CREATE_NULL_IF_MAXSEGMENTS);
-//
-//	if (seg == NULL)
-//	{
-//		elog(PGSP_LEVEL, "Too bad");
-//		pgsp->init_done = true;
-//		LWLockRelease(pgsp->lock);
-//		exit(0);
-//	}
-//
-//	dsm_pin_segment(seg);
-//
-//	pgsp->h = dsm_segment_handle(seg);
-//
-//	old_context = MemoryContextSwitchTo(TopMemoryContext);
-//	toc = shm_toc_create(PGSP_MAGIC,
-//						 dsm_segment_address(seg),
-//						 size);
-//
-//	size -= 1024;
-//
-//	dsa_space = shm_toc_allocate(toc, size);
-//	dsa = dsa_create_in_place(dsa_space,
-//			size,
-//			LWTRANCHE_PER_SESSION_DSA,
-//			seg);
-//	shm_toc_insert(toc, PGSP_DATA_KEY, dsa_space);
-//
-//	dsm_pin_segment(seg);
-//	dsa_pin_mapping(dsa);
-//
-//	MemoryContextSwitchTo(old_context);
-//
-//	on_dsm_detach(seg, pgsp_detach, (Datum) 0);
-//
-//	pgsp->init_done = true;
-//	LWLockRelease(pgsp->lock);
-//
-//	/* And now sleep forever */
-//	for (;;)
-//	{
-//		/* sleep */
-//		WaitLatch(&MyProc->procLatch,
-//				  WL_LATCH_SET | WL_POSTMASTER_DEATH,
-//				  0
-//#if PG_VERSION_NUM >= 100000
-//				  ,PG_WAIT_EXTENSION
-//#endif
-//				  );
-//		ResetLatch(&MyProc->procLatch);
-//	}
-//}
 /*
  * shmem_startup hook: allocate or attach to shared memory,
  */
