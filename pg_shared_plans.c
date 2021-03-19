@@ -57,7 +57,8 @@ typedef struct pgspEntry
 {
 	pgspHashKey key;		/* hash key of entry - MUST BE FIRST */
 	dsm_handle  h;			/* Only modified holding exclusive pgsp->lock */
-	double		len;		/* serialized plan length */
+	size_t		len;		/* serialized plan length */
+	double		plantime;	/* first generic planning time */
 	slock_t		mutex;		/* protects following fields only */
 	int64		bypass;		/* number of times magic happened */
 	double		usage;		/* usage factor */
@@ -89,6 +90,7 @@ static HTAB *pgsp_hash = NULL;
 
 static bool pgsp_enabled = true;
 static int	pgsp_max = 1000;
+static int	pgsp_min_plantime = 10;
 
 /*---- Function declarations ----*/
 
@@ -114,7 +116,7 @@ static uint32 pgsp_hash_fn(const void *key, Size keysize);
 static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
 static Size pgsp_memsize(void);
 static pgspEntry *pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg,
-		size_t len);
+		size_t len, double plantime);
 static void pgsp_entry_dealloc(void);
 static void pgsp_entry_remove(pgspEntry *entry);
 static int entry_cmp(const void *lhs, const void *rhs);
@@ -162,6 +164,19 @@ _PG_init(void)
 							 */
 							5 * MaxConnections,
 							PGC_POSTMASTER,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_shared_plans.min_plan_time",
+							"Sets the minimum planning time to save an entry (in ms).",
+							NULL,
+							&pgsp_min_plantime,
+							10,
+							0,
+							INT_MAX,
+							PGC_SUSET,
 							0,
 							NULL,
 							NULL,
@@ -249,6 +264,9 @@ pgsp_planner_hook(Query *parse,
 	PlannedStmt	   *result, *generic;
 	pgspHashKey		key;
 	pgspEntry	   *entry;
+	instr_time		planstart,
+					planduration;
+	double			plantime;
 
 	if (!pgsp_enabled || parse->queryId == UINT64CONST(0) || boundParams == NULL)
 		goto fallback;
@@ -288,7 +306,7 @@ pgsp_planner_hook(Query *parse,
 
 			SpinLockAcquire(&e->mutex);
 			e->bypass += 1;
-			e->usage += e->len; /* should figure out something less stupid */
+			e->usage += e->plantime;
 			SpinLockRelease(&e->mutex);
 
 			result = (PlannedStmt *) stringToNode(local);
@@ -313,11 +331,15 @@ pgsp_planner_hook(Query *parse,
 	else
 		result = standard_planner(parse, query_string, cursorOptions, boundParams);
 
-	/* Also generate a generic plan */
+	/* Also generate a generic plan, with its planning time */
+	INSTR_TIME_SET_CURRENT(planstart);
 	generic = standard_planner(generic_parse, query_string, cursorOptions, NULL);
+	INSTR_TIME_SET_CURRENT(planduration);
+	INSTR_TIME_SUBTRACT(planduration, planstart);
+	plantime = INSTR_TIME_GET_DOUBLE(planduration) * 1000.0;
 
 	/* Save the plan if no one did it yet */
-	if (!entry)
+	if (!entry && plantime > pgsp_min_plantime)
 	{
 		dsm_segment *seg;
 		size_t		len;
@@ -336,7 +358,7 @@ pgsp_planner_hook(Query *parse,
 			return result;
 
 		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-		entry = pgsp_entry_alloc(&key, seg, len);
+		entry = pgsp_entry_alloc(&key, seg, len, plantime);
 		LWLockRelease(pgsp->lock);
 	}
 
@@ -508,7 +530,8 @@ pgsp_memsize(void)
  * caller must hold an exclusive lock on pgsp->lock
  */
 static pgspEntry *
-pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg, size_t len)
+pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg, size_t len,
+		double plantime)
 {
 	pgspEntry  *entry;
 	bool		found;
@@ -526,6 +549,7 @@ pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg, size_t len)
 	{
 		/* New entry, initialize it */
 		entry->len = len;
+		entry->plantime = plantime;
 		entry->bypass = 0;
 		entry->usage = PGSP_USAGE_INIT;
 
@@ -776,7 +800,7 @@ pg_shared_plans_info(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
-#define PG_SHARED_PLANS_COLS			5
+#define PG_SHARED_PLANS_COLS			7
 Datum
 pg_shared_plans(PG_FUNCTION_ARGS)
 {
@@ -812,6 +836,10 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 						   INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "bypass",
 						   INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "len",
+						   INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "plantime",
+						   FLOAT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "plans",
 						   TEXTOID, -1, 0);
 
@@ -856,6 +884,8 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		int			i = 0;
 		int64		queryid = entry->key.queryid;
 		int64		bypass = entry->bypass;
+		int64		len = entry->len;
+		double		plantime = entry->plantime;
 
 		Assert(fctx->call_cntr < fctx->max_calls);
 		Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
@@ -870,6 +900,8 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		values[i++] = ObjectIdGetDatum(entry->key.dbid);
 		values[i++] = Int64GetDatumFast(queryid);
 		values[i++] = Int64GetDatumFast(bypass);
+		values[i++] = Int64GetDatumFast(len);
+		values[i++] = Float8GetDatumFast(plantime);
 
 		if (showplan)
 		{
