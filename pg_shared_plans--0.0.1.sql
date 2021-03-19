@@ -36,7 +36,7 @@ CREATE FUNCTION pg_shared_plans(IN showplan boolean,
     OUT dbid oid,
     OUT queryid bigint,
     OUT bypass int8,
-    OUT len int8,
+    OUT size int8,
     OUT plantime float8,
     OUT plan text)
 RETURNS SETOF record

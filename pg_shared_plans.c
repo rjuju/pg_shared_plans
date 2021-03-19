@@ -836,7 +836,7 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 						   INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "bypass",
 						   INT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "len",
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "size",
 						   INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "plantime",
 						   FLOAT8OID, -1, 0);
