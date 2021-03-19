@@ -372,7 +372,7 @@ pgsp_planner_hook(Query *parse,
 			bool				use_cached = false;
 
 			/* We should already have computed a custom plan */
-			Assert(e->generic_cost > 0);
+			Assert(e->generic_cost > 0 && e->plantime > 0);
 
 			SpinLockAcquire(&e->mutex);
 
@@ -420,18 +420,18 @@ pgsp_planner_hook(Query *parse,
 	LWLockRelease(pgsp->lock);
 
 	if (!entry)
+	{
 		generic_parse = copyObject(parse);
+		INSTR_TIME_SET_CURRENT(planstart);
+	}
 
 	if (prev_planner_hook)
 		result = (*prev_planner_hook) (parse, query_string, cursorOptions, boundParams);
 	else
 		result = standard_planner(parse, query_string, cursorOptions, boundParams);
 
-	if (!entry)
+	if(!entry)
 	{
-		/* Also generate a generic plan, with its planning time */
-		INSTR_TIME_SET_CURRENT(planstart);
-		generic = standard_planner(generic_parse, query_string, cursorOptions, NULL);
 		INSTR_TIME_SET_CURRENT(planduration);
 		INSTR_TIME_SUBTRACT(planduration, planstart);
 		plantime = INSTR_TIME_GET_DOUBLE(planduration) * 1000.0;
@@ -442,6 +442,9 @@ pgsp_planner_hook(Query *parse,
 	{
 		dsm_segment *seg;
 		size_t		len;
+
+		/* Generate a generic plan */
+		generic = standard_planner(generic_parse, query_string, cursorOptions, NULL);
 
 		/*
 		 * We store the plan is dsm before acquiring the lwlock.  It means that
@@ -466,6 +469,8 @@ pgsp_planner_hook(Query *parse,
 	{
 		volatile pgspEntry *e = (volatile pgspEntry *) entry;
 		Cost custom_cost = pgsp_cached_plan_cost(result, true);
+
+		Assert(entry);
 
 		SpinLockAcquire(&e->mutex);
 		Assert(e->num_custom_plans < pgsp_threshold);
