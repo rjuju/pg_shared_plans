@@ -87,11 +87,12 @@ static PlannedStmt *pgsp_planner_hook(Query *parse,
 									  int cursorOptions,
 									  ParamListInfo boundParams);
 
+static dsm_segment *pgsp_allocate_plan(PlannedStmt *stmt);
 static void pgsp_detach(dsm_segment *segment, Datum datum);
 static uint32 pgsp_hash_fn(const void *key, Size keysize);
 static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
 static Size pgsp_memsize(void);
-static pgspEntry *pgsp_entry_alloc(pgspHashKey *key);
+static pgspEntry *pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg);
 
 
 /*
@@ -262,7 +263,6 @@ pgsp_planner_hook(Query *parse,
 		}
 
 		toc = shm_toc_attach(PGSP_MAGIC, dsm_segment_address(seg));
-
 		local = (char *) shm_toc_lookup(toc, 0, true);
 
 		if (local != NULL)
@@ -272,7 +272,8 @@ pgsp_planner_hook(Query *parse,
 			result = (PlannedStmt *) stringToNode(local);
 			dsm_detach(seg);
 
-			goto release;
+			LWLockRelease(pgsp->lock);
+			return result;
 		}
 
 		dsm_detach(seg);
@@ -289,77 +290,32 @@ pgsp_planner_hook(Query *parse,
 	else
 		result = standard_planner(parse, query_string, cursorOptions, boundParams);
 
+	/* Also generate a generic plan */
 	generic = standard_planner(generic_parse, query_string, cursorOptions, NULL);
 
 	/* Save the plan if no one did it yet */
 	if (!entry)
 	{
-		shm_toc_estimator estimator;
-		dsm_segment *seg = NULL;
-		dsm_handle h;
-		shm_toc *toc;
-		char *local;
-		char *serialized;
-		size_t len, size;
+		dsm_segment *seg;
 
 		/*
 		 * We store the plan is dsm before acquiring the lwlock.  It means that
 		 * we may have to discard it, but it avoids locking overhead.
 		 */
-		serialized = nodeToString(generic);
-		len = strlen(serialized) + 1;
-
-		shm_toc_initialize_estimator(&estimator);
-		shm_toc_estimate_keys(&estimator, 1);
-		shm_toc_estimate_chunk(&estimator, len);
-		size = shm_toc_estimate(&estimator);
-
-		seg = dsm_create(size, DSM_CREATE_NULL_IF_MAXSEGMENTS);
-
-		/* out of memory */
-		if (seg == NULL)
-		{
-			elog(PGSP_LEVEL, "out of mem");
-			goto finish;
-		}
-
-		h = dsm_segment_handle(seg);
-		toc = shm_toc_create(PGSP_MAGIC, dsm_segment_address(seg), size);
-		local = (char *) shm_toc_allocate(toc, len);
-		memcpy(local, serialized, len);
-		shm_toc_insert(toc, 0, local);
-
-		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-		entry = pgsp_entry_alloc(&key);
+		seg = pgsp_allocate_plan(generic);
 
 		/*
-		 * out of memory
+		 * Don't try to allocate a new entry if we couldn't store the plan in
+		 * dsm.
 		 */
-		if (entry == NULL)
-		{
-			elog(PGSP_LEVEL, "could not alloc entry");
-			goto release;
-		}
+		if (!seg)
+			return result;
 
-		/* Store the segment if we just allocated the entry */
-		if (entry->h == DSM_HANDLE_INVALID)
-		{
-			Assert(h != DSM_HANDLE_INVALID);
-			entry->h = h;
-			dsm_pin_segment(seg);
-			on_dsm_detach(seg, pgsp_detach, (Datum) 0);
-
-			dsm_detach(seg);
-		}
-		goto release;
+		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+		entry = pgsp_entry_alloc(&key, seg);
+		LWLockRelease(pgsp->lock);
 	}
 
-	goto finish;
-
-release:
-	Assert(LWLockHeldByMe(pgsp->lock));
-	LWLockRelease(pgsp->lock);
-finish:
 	Assert(!LWLockHeldByMe(pgsp->lock));
 	return result;
 
@@ -369,6 +325,41 @@ fallback:
 		return (*prev_planner_hook) (parse, query_string, cursorOptions, boundParams);
 	else
 		return standard_planner(parse, query_string, cursorOptions, boundParams);
+}
+
+static dsm_segment *
+pgsp_allocate_plan(PlannedStmt *stmt)
+{
+	dsm_segment *seg;
+	shm_toc_estimator estimator;
+	shm_toc *toc;
+	char *local;
+	char *serialized;
+	size_t len, size;
+
+	serialized = nodeToString(stmt);
+	len = strlen(serialized) + 1;
+
+	shm_toc_initialize_estimator(&estimator);
+	shm_toc_estimate_keys(&estimator, 1);
+	shm_toc_estimate_chunk(&estimator, len);
+	size = shm_toc_estimate(&estimator);
+
+	seg = dsm_create(size, DSM_CREATE_NULL_IF_MAXSEGMENTS);
+
+	/* out of memory */
+	if (!seg)
+	{
+		elog(PGSP_LEVEL, "out of mem");
+		return NULL;
+	}
+
+	toc = shm_toc_create(PGSP_MAGIC, dsm_segment_address(seg), size);
+	local = (char *) shm_toc_allocate(toc, len);
+	memcpy(local, serialized, len);
+	shm_toc_insert(toc, 0, local);
+
+	return seg;
 }
 
 static void
@@ -422,7 +413,7 @@ pgsp_memsize(void)
  * caller must hold an exclusive lock on pgsp->lock
  */
 static pgspEntry *
-pgsp_entry_alloc(pgspHashKey *key)
+pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg)
 {
 	pgspEntry  *entry;
 	bool		found;
@@ -445,9 +436,16 @@ pgsp_entry_alloc(pgspHashKey *key)
 
 	if (!found)
 	{
-		/* New entry, initialize it */
-		entry->h = 0;
+		/* New entry, permanently store the given dsm segment. */
+		entry->h = dsm_segment_handle(seg);
+		dsm_pin_segment(seg);
+		on_dsm_detach(seg, pgsp_detach, (Datum) 0);
+
+		dsm_detach(seg);
 	}
+
+	/* We should always have a valid handle */
+	Assert(entry->h != DSM_HANDLE_INVALID);
 
 	return entry;
 }
