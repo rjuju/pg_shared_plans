@@ -103,6 +103,8 @@ static PlannedStmt *pgsp_planner_hook(Query *parse,
 									  ParamListInfo boundParams);
 
 static void pgsp_detach(dsm_segment *segment, Datum datum);
+static uint32 pgsp_hash_fn(const void *key, Size keysize);
+static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
 static Size pgsp_memsize(void);
 static pgspEntry *pgsp_entry_alloc(pgspHashKey *key);
 
@@ -287,10 +289,12 @@ pgsp_shmem_startup(void)
 
 	info.keysize = sizeof(pgspHashKey);
 	info.entrysize = sizeof(pgspEntry);
+	info.hash = pgsp_hash_fn;
+	info.match = pgsp_match_fn;
 	pgsp_hash = ShmemInitHash("pg_shared_plans hash",
 							  pgsp_max, pgsp_max,
 							  &info,
-							  HASH_ELEM | HASH_BLOBS);
+							  HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
 
 	LWLockRelease(AddinShmemInitLock);
 }
@@ -469,6 +473,32 @@ static void
 pgsp_detach(dsm_segment *segment, Datum datum)
 {
 	elog(PGSP_LEVEL, "pgsp_detach");
+}
+
+/* Calculate a hash value for a given key. */
+static uint32
+pgsp_hash_fn(const void *key, Size keysize)
+{
+	const pgspHashKey *k = (const pgspHashKey *) key;
+	uint32 h;
+
+	h = hash_combine(0, k->dbid);
+	h = hash_combine(h, k->queryid);
+
+	return h;
+}
+
+/* Compares two keys.  Zero means match. */
+static int
+pgsp_match_fn(const void *key1, const void *key2, Size keysize)
+{
+	const pgspHashKey *k1 = (const pgspHashKey *) key1;
+	const pgspHashKey *k2 = (const pgspHashKey *) key2;
+
+	if (k1->dbid == k2->dbid && k1->queryid == k2->queryid)
+		return 0;
+	else
+		return 1;
 }
 
 /*
