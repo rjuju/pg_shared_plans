@@ -59,12 +59,12 @@ typedef struct pgspEntry
 	dsm_handle  h;			/* Only modified holding exclusive pgsp->lock */
 	size_t		len;		/* serialized plan length */
 	double		plantime;	/* first generic planning time */
+	Cost		generic_cost;
 	slock_t		mutex;		/* protects following fields only */
 	int64		bypass;		/* number of times magic happened */
 	double		usage;		/* usage factor */
 	Cost		total_custom_cost;
 	int64		num_custom_plans;
-	Cost		generic_cost;
 } pgspEntry;
 
 /*
@@ -371,10 +371,10 @@ pgsp_planner_hook(Query *parse,
 			volatile pgspEntry *e = (volatile pgspEntry *) entry;
 			bool				use_cached = false;
 
-			SpinLockAcquire(&e->mutex);
-
 			/* We should already have computed a custom plan */
 			Assert(e->generic_cost > 0);
+
+			SpinLockAcquire(&e->mutex);
 
 			if (e->num_custom_plans >= pgsp_threshold)
 			{
@@ -1028,14 +1028,15 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		Assert(fctx->call_cntr < fctx->max_calls);
 		Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
 
-		SpinLockAcquire(&e->mutex);
 		queryid = entry->key.queryid;
-		bypass = entry->bypass;
 		len = entry->len;
 		plantime = entry->plantime;
+		generic_cost = entry->generic_cost;
+
+		SpinLockAcquire(&e->mutex);
+		bypass = entry->bypass;
 		total_custom_cost = entry-> total_custom_cost;
 		num_custom_plans = entry->num_custom_plans;
-		generic_cost = entry->generic_cost;
 		SpinLockRelease(&e->mutex);
 
 		memset(values, 0, sizeof(values));
