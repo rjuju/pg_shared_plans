@@ -33,20 +33,26 @@
 PG_MODULE_MAGIC;
 
 #define PGSP_MAGIC				0x20210318
-#define PGSP_DATA_KEY			UINT64CONST(1)
+#define PGSP_PLAN_KEY			UINT64CONST(1)
+#define PGSP_USAGE_INIT			(1.0)
+#define ASSUMED_MEDIAN_INIT		(10.0)	/* initial assumed median usage */
+#define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every entry_dealloc */
+#define USAGE_DEALLOC_PERCENT	5		/* free this % of entries at once */
 
 #define PGSP_LEVEL				DEBUG1
 
 typedef struct pgspHashKey
 {
-	Oid			dbid;			/* database OID */
-	uint64		queryid;		/* query identifier */
+	Oid			dbid;		/* database OID */
+	uint64		queryid;	/* query identifier */
 } pgspHashKey;
 
 typedef struct pgspEntry
 {
-	pgspHashKey key;			/* hash key of entry - MUST BE FIRST */
-	dsm_handle  h;
+	pgspHashKey key;		/* hash key of entry - MUST BE FIRST */
+	dsm_handle  h;			/* Only modified holding exclusive pgsp->lock */
+	slock_t		mutex;		/* protects following fields only */
+	double		usage;		/* usage factor */
 } pgspEntry;
 
 /*
@@ -54,9 +60,10 @@ typedef struct pgspEntry
  */
 typedef struct pgspSharedState
 {
-	bool		init_done;
-	LWLock	   *lock;
-	dsm_handle h;
+	LWLock	   *lock;			/* protects hashtable search/modification */
+	double		cur_median_usage;	/* current median usage in hashtable */
+	slock_t		mutex;				/* protects following fields only */
+	int64		dealloc;			/* # of times entries were deallocated */
 } pgspSharedState;
 
 /*---- Local variables ----*/
@@ -93,6 +100,8 @@ static uint32 pgsp_hash_fn(const void *key, Size keysize);
 static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
 static Size pgsp_memsize(void);
 static pgspEntry *pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg);
+static void pgsp_entry_dealloc(void);
+static int entry_cmp(const void *lhs, const void *rhs);
 
 
 /*
@@ -198,6 +207,8 @@ pgsp_shmem_startup(void)
 		/* First time through ... */
 		memset(pgsp, 0, sizeof(pgspSharedState));
 		pgsp->lock = &(GetNamedLWLockTranche("pg_shared_plans"))->lock;
+		pgsp->cur_median_usage = ASSUMED_MEDIAN_INIT;
+		SpinLockInit(&pgsp->mutex);
 	}
 
 	info.keysize = sizeof(pgspHashKey);
@@ -263,7 +274,7 @@ pgsp_planner_hook(Query *parse,
 		}
 
 		toc = shm_toc_attach(PGSP_MAGIC, dsm_segment_address(seg));
-		local = (char *) shm_toc_lookup(toc, 0, true);
+		local = (char *) shm_toc_lookup(toc, PGSP_PLAN_KEY, true);
 
 		if (local != NULL)
 		{
@@ -357,7 +368,7 @@ pgsp_allocate_plan(PlannedStmt *stmt)
 	toc = shm_toc_create(PGSP_MAGIC, dsm_segment_address(seg), size);
 	local = (char *) shm_toc_allocate(toc, len);
 	memcpy(local, serialized, len);
-	shm_toc_insert(toc, 0, local);
+	shm_toc_insert(toc, PGSP_PLAN_KEY, local);
 
 	return seg;
 }
@@ -420,23 +431,22 @@ pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg)
 
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
 
-	/* FIXME Need to write eviction code */
-	if (hash_get_num_entries(pgsp_hash) >= pgsp_max)
-	{
-		elog(WARNING, "FIXME");
-		return NULL;
-	}
-
 	/* Make space if needed */
-	//while (hash_get_num_entries(pgsp_hash) >= pgsp_max)
-	//	entry_dealloc();
+	while (hash_get_num_entries(pgsp_hash) >= pgsp_max)
+		pgsp_entry_dealloc();
 
 	/* Find or create an entry with desired hash code */
 	entry = (pgspEntry *) hash_search(pgsp_hash, key, HASH_ENTER, &found);
 
 	if (!found)
 	{
-		/* New entry, permanently store the given dsm segment. */
+		/* New entry, initialize it */
+		entry->usage = PGSP_USAGE_INIT;
+
+		/* re-initialize the mutex each time ... we assume no one using it */
+		SpinLockInit(&entry->mutex);
+
+		/* permanently store the given dsm segment */
 		entry->h = dsm_segment_handle(seg);
 		dsm_pin_segment(seg);
 		on_dsm_detach(seg, pgsp_detach, (Datum) 0);
@@ -448,6 +458,98 @@ pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg)
 	Assert(entry->h != DSM_HANDLE_INVALID);
 
 	return entry;
+}
+
+/*
+ * Deallocate least-used entries.
+ *
+ * Caller must hold an exclusive lock on pgsp->lock.
+ */
+static void
+pgsp_entry_dealloc(void)
+{
+	HASH_SEQ_STATUS hash_seq;
+	pgspEntry **entries;
+	pgspEntry  *entry;
+	int			nvictims;
+	int			i;
+
+	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
+
+	/*
+	 * Sort entries by usage and deallocate USAGE_DEALLOC_PERCENT of them.
+	 * While we're scanning the table, apply the decay factor to the usage
+	 * values, and update the mean query length.
+	 *
+	 * Note that the mean query length is almost immediately obsolete, since
+	 * we compute it before not after discarding the least-used entries.
+	 * Hopefully, that doesn't affect the mean too much; it doesn't seem worth
+	 * making two passes to get a more current result.  Likewise, the new
+	 * cur_median_usage includes the entries we're about to zap.
+	 */
+
+	entries = palloc(hash_get_num_entries(pgsp_hash) * sizeof(pgspEntry *));
+
+	i = 0;
+
+	hash_seq_init(&hash_seq, pgsp_hash);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		entries[i++] = entry;
+		entry->usage *= USAGE_DECREASE_FACTOR;
+	}
+
+	/* Sort into increasing order by usage */
+	qsort(entries, i, sizeof(pgspEntry *), entry_cmp);
+
+	/* Record the (approximate) median usage */
+	if (i > 0)
+		pgsp->cur_median_usage = entries[i / 2]->usage;
+
+	/* Now zap an appropriate fraction of lowest-usage entries */
+	nvictims = Max(10, i * USAGE_DEALLOC_PERCENT / 100);
+	nvictims = Min(nvictims, i);
+
+	for (i = 0; i < nvictims; i++)
+	{
+		pgspEntry *entry = entries[i];
+
+		/* Free the dsm segment. */
+		dsm_segment *seg = dsm_attach(entry->h);
+		Assert(seg);
+		dsm_unpin_segment(entry->h);
+		dsm_detach(seg);
+		/* And remove the hash entry. */
+		hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
+	}
+
+	pfree(entries);
+
+	/* Increment the number of times entries are deallocated */
+	{
+		volatile pgspSharedState *s = (volatile pgspSharedState *) pgsp;
+
+		SpinLockAcquire(&s->mutex);
+		s->dealloc += 1;
+		SpinLockRelease(&s->mutex);
+	}
+}
+
+/*
+ * qsort comparator for sorting into increasing usage order
+ */
+static int
+entry_cmp(const void *lhs, const void *rhs)
+{
+	double		l_usage = (*(pgspEntry *const *) lhs)->usage;
+	double		r_usage = (*(pgspEntry *const *) rhs)->usage;
+
+	if (l_usage < r_usage)
+		return -1;
+	else if (l_usage > r_usage)
+		return +1;
+	else
+		return 0;
 }
 
 Datum
