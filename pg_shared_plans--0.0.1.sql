@@ -48,8 +48,24 @@ LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
 
 CREATE VIEW pg_shared_plans AS
   SELECT DISTINCT pgss.query,
-    pgsp.userid,
-    pgsp.dbid,
+    r.rolname,
+    d.datname,
+    pgsp.queryid,
+    pgsp.bypass,
+    pg_size_pretty(pgsp.size) AS size,
+    pgsp.plantime,
+    pgsp.total_custom_cost / num_custom_plans AS avg_custom_cost,
+    pgsp.num_custom_plans,
+    pgsp.generic_cost
+  FROM pg_shared_plans(false) AS pgsp
+  LEFT JOIN pg_stat_statements AS pgss USING (dbid, queryid)
+  LEFT JOIN pg_roles AS r ON r.oid = pgsp.userid
+  LEFT JOIN pg_database AS d ON d.oid = pgsp.dbid;
+
+CREATE VIEW pg_shared_plans_detailed AS
+  SELECT DISTINCT pgss.query,
+    r.rolname,
+    d.datname,
     pgsp.queryid,
     pgsp.bypass,
     pg_size_pretty(pgsp.size) AS size,
@@ -59,6 +75,8 @@ CREATE VIEW pg_shared_plans AS
     pgsp.generic_cost,
     pgsp.plan
   FROM pg_shared_plans(true) AS pgsp
-  LEFT JOIN pg_stat_statements AS pgss USING (dbid, queryid);
+  LEFT JOIN pg_stat_statements AS pgss USING (dbid, queryid)
+  LEFT JOIN pg_roles AS r ON r.oid = pgsp.userid
+  LEFT JOIN pg_database AS d ON d.oid = pgsp.dbid;
 
 GRANT SELECT ON pg_shared_plans TO pg_read_all_stats;
