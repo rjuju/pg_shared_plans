@@ -126,9 +126,13 @@ static PlannedStmt *pgsp_planner_hook(Query *parse,
 static void pgsp_detach(dsm_segment *segment, Datum datum);
 static void pg_shared_plans_shutdown(Datum arg);
 
+static void pgsp_accum_custom_plan(pgspHashKey *key, Cost cost);
 static void pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire);
 static dsm_segment *pgsp_allocate_plan(PlannedStmt *stmt, size_t *len);
+static bool pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats);
 static char *pgsp_get_plan(dsm_segment *seg);
+static void pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic,
+		pgspHashKey *key, double plantime);
 static uint32 pgsp_hash_fn(const void *key, Size keysize);
 static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
 static Size pgsp_memsize(void);
@@ -367,35 +371,9 @@ pgsp_planner_hook(Query *parse,
 
 		if (local != NULL)
 		{
-			/* Grab the spinlock while updating the counters. */
-			volatile pgspEntry *e = (volatile pgspEntry *) entry;
-			bool				use_cached = false;
+			bool	use_cached;
 
-			/* We should already have computed a custom plan */
-			Assert(e->generic_cost > 0 && e->plantime > 0);
-
-			SpinLockAcquire(&e->mutex);
-
-			if (e->num_custom_plans >= pgsp_threshold)
-			{
-				double				avg;
-
-				avg = e->total_custom_cost / e->num_custom_plans;
-				use_cached = (e->generic_cost < avg);
-
-				if (use_cached)
-				{
-					e->bypass += 1;
-					e->usage += e->plantime;
-				}
-			}
-			else
-			{
-				/* Increment usage so that it doesn't get evicted too soon */
-				e->usage += e->plantime;
-				accum_custom_stats = true;
-			}
-			SpinLockRelease(&e->mutex);
+			use_cached = pgsp_choose_cache_plan(entry, &accum_custom_stats);
 
 			if (use_cached)
 			{
@@ -440,43 +418,16 @@ pgsp_planner_hook(Query *parse,
 	/* Save the plan if no one did it yet */
 	if (!entry && plantime > pgsp_min_plantime)
 	{
-		dsm_segment *seg;
-		size_t		len;
-
 		/* Generate a generic plan */
-		generic = standard_planner(generic_parse, query_string, cursorOptions, NULL);
-
-		/*
-		 * We store the plan is dsm before acquiring the lwlock.  It means that
-		 * we may have to discard it, but it avoids locking overhead.
-		 */
-		seg = pgsp_allocate_plan(generic, &len);
-
-		/*
-		 * Don't try to allocate a new entry if we couldn't store the plan in
-		 * dsm.
-		 */
-		if (!seg)
-			return result;
-
-		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-		entry = pgsp_entry_alloc(&key, seg, len, plantime,
-								 pgsp_cached_plan_cost(result, true),
-								 pgsp_cached_plan_cost(generic, false));
-		LWLockRelease(pgsp->lock);
+		generic = standard_planner(generic_parse, query_string, cursorOptions,
+								   NULL);
+		pgsp_cache_plan(result, generic, &key, plantime);
 	}
 	else if (accum_custom_stats)
 	{
-		volatile pgspEntry *e = (volatile pgspEntry *) entry;
 		Cost custom_cost = pgsp_cached_plan_cost(result, true);
 
-		Assert(entry);
-
-		SpinLockAcquire(&e->mutex);
-		Assert(e->num_custom_plans < pgsp_threshold);
-		e->total_custom_cost += custom_cost;
-		e->num_custom_plans += 1;
-		SpinLockRelease(&e->mutex);
+		pgsp_accum_custom_plan(&key, custom_cost);
 	}
 
 	Assert(!LWLockHeldByMe(pgsp->lock));
@@ -496,10 +447,42 @@ pgsp_detach(dsm_segment *segment, Datum datum)
 	elog(DEBUG1, "pgsp_detach");
 }
 
+/* Release pgsp->lock that was acquired during pg_shared_plans(). */
 static void
 pg_shared_plans_shutdown(Datum arg)
 {
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
+	LWLockRelease(pgsp->lock);
+}
+
+/*
+ * Accumulate statistics for custom planing.  Caller mustn't hold the LWLock.
+ *
+ * Note that even though caller should only call that function if the number of
+ * custom plans hasn't reached pgsp_threshold, it may not be the case anymore
+ * when we acquire the spinlock.  In that case we still accumulate the data as
+ * we generated a custom plan, so it seems worthy to have more preciser
+ * information about it.
+ */
+static void
+pgsp_accum_custom_plan(pgspHashKey *key, Cost custom_cost)
+{
+	pgspEntry *entry;
+
+	Assert(!LWLockHeldByMe(pgsp->lock));
+	LWLockAcquire(pgsp->lock, LW_SHARED);
+
+	entry = hash_search(pgsp_hash, key, HASH_FIND, NULL);
+	if (entry)
+	{
+		volatile pgspEntry *e = (volatile pgspEntry *) entry;
+
+		SpinLockAcquire(&e->mutex);
+		e->total_custom_cost += custom_cost;
+		e->num_custom_plans += 1;
+		SpinLockRelease(&e->mutex);
+	}
+
 	LWLockRelease(pgsp->lock);
 }
 
@@ -598,6 +581,52 @@ pgsp_allocate_plan(PlannedStmt *stmt, size_t *len)
 	return seg;
 }
 
+/*
+ * Decide whether to use a cached plan or not, and if caller should accumulate
+ * custom plan statistics.
+ * Also takes care of maintaining bypass and usage counters.
+ * Caller must hold a shared lock on pgsp->lock.
+ */
+static bool
+pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats)
+{
+	/* Grab the spinlock while updating the counters. */
+	volatile pgspEntry *e = (volatile pgspEntry *) entry;
+	bool				use_cached = false;
+
+	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
+
+	/* We should already have computed a custom plan */
+	Assert(e->generic_cost > 0 && e->len > 0 && e->h > 0 &&
+		   e->plantime > 0);
+
+	SpinLockAcquire(&e->mutex);
+
+	if (e->num_custom_plans >= pgsp_threshold)
+	{
+		double				avg;
+
+		avg = e->total_custom_cost / e->num_custom_plans;
+		use_cached = (e->generic_cost < avg);
+
+		if (use_cached)
+		{
+			e->bypass += 1;
+			e->usage += e->plantime;
+		}
+	}
+	else
+	{
+		/* Increment usage so that it doesn't get evicted too soon */
+		e->usage += e->plantime;
+		/* And tell caller to later accumulate custom plan statistics. */
+		*accum_custom_stats = true;
+	}
+	SpinLockRelease(&e->mutex);
+
+	return use_cached;
+}
+
 static char *
 pgsp_get_plan(dsm_segment *seg)
 {
@@ -609,6 +638,41 @@ pgsp_get_plan(dsm_segment *seg)
 	Assert(toc);
 
 	return (char *) shm_toc_lookup(toc, PGSP_PLAN_KEY, true);
+}
+
+/*
+ * Store a generic plan in shared memory, and allocate a new entry to associate
+ * the plan with.
+ */
+static void
+pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic, pgspHashKey *key,
+				double plantime)
+{
+	dsm_segment *seg;
+	pgspEntry *entry PG_USED_FOR_ASSERTS_ONLY;
+	size_t		len;
+
+	Assert(!LWLockHeldByMe(pgsp->lock));
+
+	/*
+	 * We store the plan is dsm before acquiring the lwlock.  It means that
+	 * we may have to discard it, but it avoids locking overhead.
+	 */
+	seg = pgsp_allocate_plan(generic, &len);
+
+	/*
+	 * Don't try to allocate a new entry if we couldn't store the plan in
+	 * dsm.
+	 */
+	if (!seg)
+		return;
+
+	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+	entry = pgsp_entry_alloc(key, seg, len, plantime,
+							 pgsp_cached_plan_cost(custom, true),
+							 pgsp_cached_plan_cost(generic, false));
+	Assert(entry);
+	LWLockRelease(pgsp->lock);
 }
 
 /* Calculate a hash value for a given key. */
@@ -656,8 +720,9 @@ pgsp_memsize(void)
 }
 
 /*
- * Allocate a new hashtable entry.
- * caller must hold an exclusive lock on pgsp->lock
+ * Allocate a new hashtable entry if no one did the job before, and associate
+ * it with the given dsm_segment that holds the generic plan for that entry.
+ * Caller must hold an exclusive lock on pgsp->lock
  */
 static pgspEntry *
 pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg, size_t len,
