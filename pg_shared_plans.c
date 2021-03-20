@@ -204,7 +204,7 @@ _PG_init(void)
 							NULL,
 							&pgsp_threshold,
 							5,
-							0,
+							1,
 							INT_MAX,
 							PGC_SUSET,
 							0,
