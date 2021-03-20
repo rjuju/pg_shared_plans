@@ -51,6 +51,7 @@ typedef struct pgspHashKey
 	Oid			userid;		/* user OID is plans has RLS */
 	Oid			dbid;		/* database OID */
 	uint64		queryid;	/* query identifier */
+	uint32		constid;	/* hash of the consts still present */
 } pgspHashKey;
 
 typedef struct pgspEntry
@@ -60,12 +61,19 @@ typedef struct pgspEntry
 	size_t		len;		/* serialized plan length */
 	double		plantime;	/* first generic planning time */
 	Cost		generic_cost;
+	int			numconst;
 	slock_t		mutex;		/* protects following fields only */
 	int64		bypass;		/* number of times magic happened */
 	double		usage;		/* usage factor */
 	Cost		total_custom_cost;
 	int64		num_custom_plans;
 } pgspEntry;
+
+typedef struct pgspWalkerContext
+{
+	uint32	constid;
+	int		numconst;
+} pgspWalkerContext;
 
 /*
  * Global shared state
@@ -132,14 +140,16 @@ static dsm_segment *pgsp_allocate_plan(PlannedStmt *stmt, size_t *len);
 static bool pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats);
 static char *pgsp_get_plan(dsm_segment *seg);
 static void pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic,
-		pgspHashKey *key, double plantime);
+		pgspHashKey *key, double plantime, int numconst);
 static uint32 pgsp_hash_fn(const void *key, Size keysize);
 static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
 static Size pgsp_memsize(void);
 static pgspEntry *pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg,
-		size_t len, double plantime, Cost custom_cost, Cost generic_cost);
+		size_t len, double plantime, Cost custom_cost, Cost generic_cost,
+		int numconst);
 static void pgsp_entry_dealloc(void);
 static void pgsp_entry_remove(pgspEntry *entry);
+static bool pgsp_query_walker(Node *node, pgspWalkerContext *context);
 static int entry_cmp(const void *lhs, const void *rhs);
 
 
@@ -337,6 +347,7 @@ pgsp_planner_hook(Query *parse,
 					planduration;
 	double			plantime;
 	bool			accum_custom_stats = false;
+	pgspWalkerContext context;
 
 	if (!pgsp_enabled || parse->queryId == UINT64CONST(0) || boundParams == NULL)
 		goto fallback;
@@ -348,6 +359,12 @@ pgsp_planner_hook(Query *parse,
 		key.userid = InvalidOid;
 	key.dbid = MyDatabaseId;
 	key.queryid = parse->queryId;
+
+	/* Found unhandled nodes, don't try to cache the plan. */
+	context.constid = 0;
+	context.numconst = 0;
+	pgsp_query_walker((Node *) parse, &context);
+	key.constid = context.constid;
 
 	/* Lookup the hash table entry with shared lock. */
 	LWLockAcquire(pgsp->lock, LW_SHARED);
@@ -421,7 +438,7 @@ pgsp_planner_hook(Query *parse,
 		/* Generate a generic plan */
 		generic = standard_planner(generic_parse, query_string, cursorOptions,
 								   NULL);
-		pgsp_cache_plan(result, generic, &key, plantime);
+		pgsp_cache_plan(result, generic, &key, plantime, context.numconst);
 	}
 	else if (accum_custom_stats)
 	{
@@ -646,7 +663,7 @@ pgsp_get_plan(dsm_segment *seg)
  */
 static void
 pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic, pgspHashKey *key,
-				double plantime)
+				double plantime, int numconst)
 {
 	dsm_segment *seg;
 	pgspEntry *entry PG_USED_FOR_ASSERTS_ONLY;
@@ -670,7 +687,8 @@ pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic, pgspHashKey *key,
 	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
 	entry = pgsp_entry_alloc(key, seg, len, plantime,
 							 pgsp_cached_plan_cost(custom, true),
-							 pgsp_cached_plan_cost(generic, false));
+							 pgsp_cached_plan_cost(generic, false),
+							 numconst);
 	Assert(entry);
 	LWLockRelease(pgsp->lock);
 }
@@ -685,6 +703,7 @@ pgsp_hash_fn(const void *key, Size keysize)
 	h = hash_combine(0, k->userid);
 	h = hash_combine(h, k->dbid);
 	h = hash_combine(h, k->queryid);
+	h = hash_combine(h, k->constid);
 
 	return h;
 }
@@ -699,6 +718,7 @@ pgsp_match_fn(const void *key1, const void *key2, Size keysize)
 	if (k1->userid == k2->userid
 		&& k1->dbid == k2->dbid
 		&& k1->queryid == k2->queryid
+		&& k1->constid == k2->constid
 	)
 		return 0;
 	else
@@ -726,7 +746,7 @@ pgsp_memsize(void)
  */
 static pgspEntry *
 pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg, size_t len,
-		double plantime, Cost custom_cost, Cost generic_cost)
+		double plantime, Cost custom_cost, Cost generic_cost, int numconst)
 {
 	pgspEntry  *entry;
 	bool		found;
@@ -750,6 +770,7 @@ pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg, size_t len,
 		entry->total_custom_cost = custom_cost;
 		entry->num_custom_plans = 1.0;
 		entry->generic_cost = generic_cost;
+		entry->numconst = numconst;
 
 		/* re-initialize the mutex each time ... we assume no one using it */
 		SpinLockInit(&entry->mutex);
@@ -856,6 +877,41 @@ pgsp_entry_remove(pgspEntry *entry)
 }
 
 /*
+ * Walker function for query_tree_walker and expression_tree_walker to find
+ * anything incompatible with shared plans.  The problematic things are:
+ *
+ * - usage of temporary tables
+ *
+ * It will also compute the constid, used to distinguish different queries
+ * having the same queryid, in case multiple prepared statements have the same
+ * normalized queries but with different hardcoded values.
+ */
+static bool
+pgsp_query_walker(Node *node, pgspWalkerContext *context)
+{
+	if (!node)
+		return false;
+
+	if (IsA(node, Query))
+	{
+		Query *query = (Query *) node;
+
+		return query_tree_walker(query, pgsp_query_walker, context, 0);
+	}
+	else if (IsA(node, Const))
+	{
+		char   *r = nodeToString(node);
+		int		len = strlen(r);
+
+		context->constid = hash_combine(context->constid,
+										hash_any((unsigned char *) r, len));
+		context->numconst++;
+	}
+
+	return expression_tree_walker(node, pgsp_query_walker, context);
+}
+
+/*
  * qsort comparator for sorting into increasing usage order
  */
 static int
@@ -879,7 +935,7 @@ pg_shared_plans_reset(PG_FUNCTION_ARGS)
 	pgspEntry  *entry;
 	long		num_entries;
 	long		num_remove = 0;
-	pgspHashKey key;
+	//pgspHashKey key;
 	Oid			userid;
 	Oid			dbid;
 	uint64		queryid;
@@ -896,23 +952,25 @@ pg_shared_plans_reset(PG_FUNCTION_ARGS)
 	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
 	num_entries = hash_get_num_entries(pgsp_hash);
 
-	if (userid != 0 && dbid != 0 && queryid != UINT64CONST(0))
-	{
-		/* If all the parameters are available, use the fast path. */
-		key.userid = userid;
-		key.dbid = dbid;
-		key.queryid = queryid;
+	/* No fastpath yet, should user care of a specific constid? */
+	//if (userid != 0 && dbid != 0 && queryid != UINT64CONST(0))
+	//{
+	//	/* If all the parameters are available, use the fast path. */
+	//	key.userid = userid;
+	//	key.dbid = dbid;
+	//	key.queryid = queryid;
 
-		/* Remove the key if exists */
-		entry = (pgspEntry *) hash_search(pgsp_hash, &key, HASH_FIND, NULL);
+	//	/* Remove the key if exists */
+	//	entry = (pgspEntry *) hash_search(pgsp_hash, &key, HASH_FIND, NULL);
 
-		if (entry)
-		{
-			pgsp_entry_remove(entry);
-			num_remove++;
-		}
-	}
-	else if (dbid != 0 || dbid != 0 || queryid != UINT64CONST(0))
+	//	if (entry)
+	//	{
+	//		pgsp_entry_remove(entry);
+	//		num_remove++;
+	//	}
+	//}
+	//else
+	if (dbid != 0 || dbid != 0 || queryid != UINT64CONST(0))
 	{
 		/* Remove entries corresponding to valid parameters. */
 		hash_seq_init(&hash_seq, pgsp_hash);
@@ -998,7 +1056,7 @@ pg_shared_plans_info(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
-#define PG_SHARED_PLANS_COLS			10
+#define PG_SHARED_PLANS_COLS			12
 Datum
 pg_shared_plans(PG_FUNCTION_ARGS)
 {
@@ -1032,6 +1090,10 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 						   OIDOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "queryid",
 						   INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "constid",
+						   INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "numconst",
+						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "bypass",
 						   INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "size",
@@ -1118,6 +1180,11 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 			nulls[i++] = true;
 		values[i++] = ObjectIdGetDatum(entry->key.dbid);
 		values[i++] = Int64GetDatumFast(queryid);
+		if (OidIsValid(entry->key.constid))
+			values[i++] = ObjectIdGetDatum(entry->key.constid);
+		else
+			nulls[i++] = true;
+		values[i++] = Int32GetDatum(entry->numconst);
 		values[i++] = Int64GetDatumFast(bypass);
 		values[i++] = Int64GetDatumFast(len);
 		values[i++] = Float8GetDatumFast(plantime);
