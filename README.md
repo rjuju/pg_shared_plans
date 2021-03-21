@@ -20,7 +20,7 @@ if the query depends on row level security enabled relations.
 Installation
 ------------
 
-- Compatible with PostgreSQL 14 and above
+- Compatible with PostgreSQL 12 and above
 - Needs PostgreSQL header files
 - Decompress the tarball or clone the repository
 - `sudo make install`

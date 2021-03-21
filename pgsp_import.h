@@ -23,6 +23,11 @@
 #include "nodes/pg_list.h"
 #include "storage/lmgr.h"
 
+#if PG_VERSION_NUM < 130000
+#define  TYPALIGN_INT			'i' /* int alignment (typically 4 bytes) */
+#endif
+
+
 void pgsp_AcquireExecutorLocksOnPartitions(List *partitionOids, int lockmode,
 								 bool acquire);
 void pgsp_ScanQueryForLocks(Query *parsetree, bool acquire);

@@ -14,8 +14,15 @@
 #include "postgres.h"
 
 #include "access/relation.h"
+#if PG_VERSION_NUM < 130000
+#include "catalog/pg_type_d.h"
+#endif
 #include "commands/explain.h"
+#if PG_VERSION_NUM >= 130000
 #include "common/hashfn.h"
+#else
+#include "utils/hashutils.h"
+#endif
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -30,12 +37,17 @@
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/shm_toc.h"
+#if PG_VERSION_NUM >= 130000
 #include "tcop/cmdtag.h"
+#endif
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#if PG_VERSION_NUM < 140000
+#include "utils/timestamp.h"
+#endif
 
 #include "pgsp_import.h"
 
@@ -131,7 +143,9 @@ PG_FUNCTION_INFO_V1(pg_shared_plans);
 
 static void pgsp_shmem_startup(void);
 static PlannedStmt *pgsp_planner_hook(Query *parse,
+#if PG_VERSION_NUM >= 130000
 									  const char *query_string,
+#endif
 									  int cursorOptions,
 									  ParamListInfo boundParams);
 
@@ -342,7 +356,9 @@ pgsp_shmem_startup(void)
 
 static PlannedStmt *
 pgsp_planner_hook(Query *parse,
+#if PG_VERSION_NUM >= 130000
 				  const char *query_string,
+#endif
 				  int cursorOptions,
 				  ParamListInfo boundParams)
 {
@@ -441,9 +457,17 @@ pgsp_planner_hook(Query *parse,
 	}
 
 	if (prev_planner_hook)
-		result = (*prev_planner_hook) (parse, query_string, cursorOptions, boundParams);
+		result = (*prev_planner_hook) (parse,
+#if PG_VERSION_NUM >= 130000
+									   query_string,
+#endif
+									   cursorOptions, boundParams);
 	else
-		result = standard_planner(parse, query_string, cursorOptions, boundParams);
+		result = standard_planner(parse,
+#if PG_VERSION_NUM >= 130000
+								  query_string,
+#endif
+								  cursorOptions, boundParams);
 
 	if(!entry)
 	{
@@ -456,8 +480,11 @@ pgsp_planner_hook(Query *parse,
 	if (!entry && plantime > pgsp_min_plantime)
 	{
 		/* Generate a generic plan */
-		generic = standard_planner(generic_parse, query_string, cursorOptions,
-								   NULL);
+		generic = standard_planner(generic_parse,
+#if PG_VERSION_NUM >= 130000
+								   query_string,
+#endif
+								   cursorOptions, NULL);
 		pgsp_cache_plan(result, generic, &key, plantime, context.num_const);
 	}
 	else if (accum_custom_stats)
@@ -473,9 +500,17 @@ pgsp_planner_hook(Query *parse,
 fallback:
 	Assert(!LWLockHeldByMe(pgsp->lock));
 	if (prev_planner_hook)
-		return (*prev_planner_hook) (parse, query_string, cursorOptions, boundParams);
+		return (*prev_planner_hook) (parse,
+#if PG_VERSION_NUM >= 130000
+									 query_string,
+#endif
+									 cursorOptions, boundParams);
 	else
-		return standard_planner(parse, query_string, cursorOptions, boundParams);
+		return standard_planner(parse,
+#if PG_VERSION_NUM >= 130000
+								query_string,
+#endif
+								cursorOptions, boundParams);
 }
 
 static void
@@ -533,8 +568,10 @@ static void
 pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire)
 {
 	ListCell   *lc2;
+#if PG_VERSION_NUM >= 140000
 	Index		rti,
 				resultRelation = 0;
+#endif
 
 	if (plannedstmt->commandType == CMD_UTILITY)
 	{
@@ -552,9 +589,11 @@ pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire)
 		return;
 	}
 
+#if PG_VERSION_NUM >= 140000
 	rti = 1;
 	if (plannedstmt->resultRelations)
 		resultRelation = linitial_int(plannedstmt->resultRelations);
+#endif
 	foreach(lc2, plannedstmt->rtable)
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc2);
@@ -573,6 +612,7 @@ pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire)
 		else
 			UnlockRelationOid(rte->relid, rte->rellockmode);
 
+#if PG_VERSION_NUM >= 140000
 		/* Lock partitions ahead of modifying them in parallel mode. */
 		if (rti == resultRelation &&
 			plannedstmt->partitionOids != NIL)
@@ -580,8 +620,8 @@ pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire)
 												  rte->rellockmode, acquire);
 
 		rti++;
+#endif
 	}
-
 }
 
 static dsm_segment *
@@ -1049,7 +1089,9 @@ do_showplans(dsm_segment *seg)
 	es->costs = pgsp_es_costs;
 	es->verbose = pgsp_es_verbose;
 	es->buffers = false;
+#if PG_VERSION_NUM >= 130000
 	es->wal = false;
+#endif
 	es->timing = false;
 	es->summary = false;
 	es->format = pgsp_es_format;
@@ -1058,7 +1100,11 @@ do_showplans(dsm_segment *seg)
 
 	pgsp_acquire_executor_locks(stmt, true);
 	ExplainBeginOutput(es);
-	ExplainOnePlan(stmt, NULL, es, "", NULL, NULL, NULL, NULL);
+	ExplainOnePlan(stmt, NULL, es, "", NULL, NULL, NULL
+#if PG_VERSION_NUM >= 130000
+				   ,NULL
+#endif
+				   );
 	pgsp_acquire_executor_locks(stmt, false);
 
 	return es->str->data;
