@@ -4,7 +4,7 @@
 -- Copyright (C) 2021: Julien Rouhaud
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
-\echo Use "CREATE EXTENSION pg_shared_plans" to load this file. \quit
+--\echo Use "CREATE EXTENSION pg_shared_plans" to load this file. \quit
 
 --- Define pg_shared_plans_info
 CREATE FUNCTION pg_shared_plans_info(
@@ -51,7 +51,7 @@ AS 'MODULE_PATHNAME', 'pg_shared_plans'
 LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
 
 CREATE VIEW pg_shared_plans AS
-  SELECT DISTINCT pgss.query,
+  SELECT DISTINCT
     r.rolname,
     d.datname,
     pgsp.queryid,
@@ -63,14 +63,15 @@ CREATE VIEW pg_shared_plans AS
     pgsp.total_custom_cost / num_custom_plans AS avg_custom_cost,
     pgsp.num_custom_plans,
     pgsp.generic_cost,
-    pgsp.num_relations
+    pgsp.num_relations,
+    pgss.query
   FROM pg_shared_plans(false, false) AS pgsp
   LEFT JOIN pg_stat_statements AS pgss USING (dbid, queryid)
   LEFT JOIN pg_roles AS r ON r.oid = pgsp.userid
   LEFT JOIN pg_database AS d ON d.oid = pgsp.dbid;
 
 CREATE VIEW pg_shared_plans_relations AS
-  SELECT DISTINCT pgss.query,
+  SELECT DISTINCT
     r.rolname,
     d.datname,
     pgsp.numconst,
@@ -81,6 +82,7 @@ CREATE VIEW pg_shared_plans_relations AS
     pgsp.num_custom_plans,
     pgsp.generic_cost,
     pgsp.num_relations,
+    pgss.query,
     pgsp.relations
   FROM pg_shared_plans(true, false) AS pgsp
   LEFT JOIN pg_stat_statements AS pgss USING (dbid, queryid)
@@ -88,7 +90,7 @@ CREATE VIEW pg_shared_plans_relations AS
   LEFT JOIN pg_database AS d ON d.oid = pgsp.dbid;
 
 CREATE VIEW pg_shared_plans_explain AS
-  SELECT DISTINCT pgss.query,
+  SELECT DISTINCT
     r.rolname,
     d.datname,
     pgsp.queryid,
@@ -101,6 +103,7 @@ CREATE VIEW pg_shared_plans_explain AS
     pgsp.num_custom_plans,
     pgsp.generic_cost,
     pgsp.num_relations,
+    pgss.query,
     pgsp.plan
   FROM pg_shared_plans(false, true) AS pgsp
   LEFT JOIN pg_stat_statements AS pgss USING (dbid, queryid)
@@ -108,7 +111,7 @@ CREATE VIEW pg_shared_plans_explain AS
   LEFT JOIN pg_database AS d ON d.oid = pgsp.dbid;
 
 CREATE VIEW pg_shared_plans_all AS
-  SELECT DISTINCT pgss.query,
+  SELECT DISTINCT
     r.rolname,
     d.datname,
     pgsp.queryid,
@@ -121,6 +124,7 @@ CREATE VIEW pg_shared_plans_all AS
     pgsp.num_custom_plans,
     pgsp.generic_cost,
     pgsp.num_relations,
+    pgss.query,
     pgsp.relations,
     pgsp.plan
   FROM pg_shared_plans(true, true) AS pgsp
