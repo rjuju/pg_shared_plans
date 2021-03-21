@@ -20,6 +20,7 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "pgstat.h"
 #include "storage/ipc.h"
@@ -223,7 +224,7 @@ _PG_init(void)
 							"Minimum number of custom plans to generate before maybe choosing cached plans.",
 							NULL,
 							&pgsp_threshold,
-							5,
+							4,
 							1,
 							INT_MAX,
 							PGC_SUSET,
@@ -411,6 +412,13 @@ pgsp_planner_hook(Query *parse,
 				dsm_detach(seg);
 				LWLockRelease(pgsp->lock);
 				pgsp_acquire_executor_locks(result, true);
+
+				/*
+				 * Nullify plancache's heuristic to try to prefer local cachaed
+				 * plan so that it prefers to use own.
+				 */
+				result->planTree->total_cost -= (1000.0 * cpu_operator_cost
+						* (list_length(result->rtable) + 1) + 10);
 
 				return result;
 			}

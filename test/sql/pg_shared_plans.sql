@@ -1,17 +1,51 @@
-SET join_collapse_limit = 12;
-SET geqo_threshold = 20;
-SET plan_cache_mode = force_custom_plan;
-
 CREATE EXTENSION pg_stat_statements WITH SCHEMA public;
 CREATE EXTENSION pg_shared_plans WITH SCHEMA public;
 
 SELECT pg_shared_plans_reset();
 
-SET pg_shared_plans.enabled = on;
+--
+-- Test plancache override
+--
+SET plan_cache_mode TO auto;
+SET pg_shared_plans.enabled = off;
+SET pg_shared_plans.min_plan_time = '0ms';
+CREATE TABLE plancache AS SELECT 1 AS id, 'val' AS text;
+PREPARE plancache(int) AS SELECT * FROM plancache WHERE id = $1;
 
+EXECUTE plancache(1);
+EXECUTE plancache(1);
+EXECUTE plancache(1);
+EXECUTE plancache(1);
+EXECUTE plancache(1);
+-- should be a generic plan
+EXPLAIN (COSTS OFF) execute plancache(1);
+
+SET pg_shared_plans.enabled = on;
+SET pg_shared_plans.threshold = 4;
+PREPARE plancache2(int) AS SELECT * FROM plancache WHERE id = $1;
+EXECUTE plancache2(1);
+EXECUTE plancache2(1);
+EXECUTE plancache2(1);
+EXECUTE plancache2(1);
+EXECUTE plancache2(1);
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
+    plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
+    generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
+FROM public.pg_shared_plans_all pgsp
+WHERE query LIKE '%plancache%';
+
+-- Test all SRFs
+SELECT count(*) FROM pg_shared_plans(false, false);
+SELECT count(*) FROM pg_shared_plans(false, true);
+SELECT count(*) FROM pg_shared_plans(true, false);
+SELECT count(*) FROM pg_shared_plans(true, true);
 --
 -- Test general behavior with planning time threshold
 --
+SET join_collapse_limit = 12;
+SET geqo_threshold = 20;
+SET plan_cache_mode = force_custom_plan;
+SET pg_shared_plans.enabled = on;
 SET pg_shared_plans.threshold = 1;
 SET pg_shared_plans.min_plan_time = '50ms';
 
@@ -66,12 +100,6 @@ SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
 FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%+%';
-
--- Test all SRFs
-SELECT count(*) FROM pg_shared_plans(false, false);
-SELECT count(*) FROM pg_shared_plans(false, true);
-SELECT count(*) FROM pg_shared_plans(true, false);
-SELECT count(*) FROM pg_shared_plans(true, true);
 
 -- Test correct behavior when there are no source relation */
 set pg_shared_plans.min_plan_time = '0ms';
