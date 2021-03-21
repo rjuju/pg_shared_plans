@@ -36,7 +36,6 @@
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
-#include "storage/shm_toc.h"
 #if PG_VERSION_NUM >= 130000
 #include "tcop/cmdtag.h"
 #endif
@@ -53,6 +52,7 @@
 
 PG_MODULE_MAGIC;
 
+#define PGSP_TRANCHE_NAME		"pg_shared_plans"
 #define PGSP_MAGIC				0x20210318
 #define PGSP_PLAN_KEY			UINT64CONST(1)
 #define PGSP_REL_KEY			UINT64CONST(2)
@@ -72,18 +72,27 @@ typedef struct pgspHashKey
 typedef struct pgspEntry
 {
 	pgspHashKey key;		/* hash key of entry - MUST BE FIRST */
-	dsm_handle  h;			/* only modified holding exclusive pgsp->lock */
 	size_t		len;		/* serialized plan length */
+	dsa_pointer plan;		/* only modified holding exclusive pgsp->lock */
+	int			num_rels;	/* # of referenced base relations */
+	dsa_pointer rels;		/* only modified holding exclusive pgsp->lock */
+	int			num_const;	/* # of const values in the plan */
 	double		plantime;	/* first generic planning time */
 	Cost		generic_cost; /* total cost of the stored plan */
-	int			num_const;	/* # of const values in the plan */
-	int			num_rels;	/* # of referenced base relations */
 	slock_t		mutex;		/* protects following fields only */
 	int64		bypass;		/* number of times magic happened */
 	double		usage;		/* usage factor */
 	Cost		total_custom_cost; /* total cost of custom plans planned */
 	int64		num_custom_plans; /* # of custom plans planned */
 } pgspEntry;
+
+typedef struct pgspDsaContext
+{
+	dsa_pointer		plan;
+	dsa_pointer		rels;
+	size_t			len;
+	int				num_rels;
+} pgspDsaContext;
 
 typedef struct pgspWalkerContext
 {
@@ -97,6 +106,8 @@ typedef struct pgspWalkerContext
 typedef struct pgspSharedState
 {
 	LWLock	   *lock;			/* protects hashtable search/modification */
+	int			LWTRANCHE_PGSP;
+	dsa_handle	pgsp_dsa_handle;
 	double		cur_median_usage;	/* current median usage in hashtable */
 	slock_t		mutex;				/* protects following fields only */
 	int64		dealloc;			/* # of times entries were deallocated */
@@ -112,6 +123,7 @@ static planner_hook_type prev_planner_hook = NULL;
 /* Links to shared memory state */
 static pgspSharedState *pgsp = NULL;
 static HTAB *pgsp_hash = NULL;
+static dsa_area *area = NULL;
 
 /*---- GUC variables ----*/
 
@@ -149,29 +161,27 @@ static PlannedStmt *pgsp_planner_hook(Query *parse,
 									  int cursorOptions,
 									  ParamListInfo boundParams);
 
-static void pgsp_detach(dsm_segment *segment, Datum datum);
+static void pgsp_attach_dsa(void);
 static void pg_shared_plans_shutdown(Datum arg);
 
 static void pgsp_accum_custom_plan(pgspHashKey *key, Cost cost);
 static void pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire);
-static dsm_segment *pgsp_allocate_plan(PlannedStmt *stmt, size_t *len,
-									   int *num_rels);
+static bool pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context);
 static bool pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats);
-static char *pgsp_get_plan(dsm_segment *seg);
+static const char *pgsp_get_plan(dsa_pointer plan);
 static void pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic,
 		pgspHashKey *key, double plantime, int num_const);
 static uint32 pgsp_hash_fn(const void *key, Size keysize);
 static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
 static Size pgsp_memsize(void);
-static pgspEntry *pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg,
-		size_t len, double plantime, Cost custom_cost, Cost generic_cost,
-		int num_const, int num_rels);
+static pgspEntry *pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context,
+		double plantime, int num_const, Cost custom_cost, Cost generic_cost);
 static void pgsp_entry_dealloc(void);
 static void pgsp_entry_remove(pgspEntry *entry);
 static bool pgsp_query_walker(Node *node, pgspWalkerContext *context);
 static int entry_cmp(const void *lhs, const void *rhs);
-static Datum do_showrels(dsm_segment *seg, int num_rels);
-static char *do_showplans(dsm_segment *seg);
+static Datum do_showrels(dsa_pointer rels, int num_rels);
+static char *do_showplans(dsa_pointer plan);
 
 
 /*
@@ -204,17 +214,9 @@ _PG_init(void)
 							"Sets the maximum number of plans tracked by pg_shared_plans.",
 							NULL,
 							&pgsp_max,
-							200,
+							1000,
 							100,
-							/*
-							 * FIXME: should allocate multiple plans per
-							 * segment, as there can only be
-							 * PG_DYNSHMEM_FIXED_SLOTS +
-							 *   PG_DYNSHMEM_SLOTS_PER_BACKEND * MaxBackends
-							 * segments.  Leave some room for the rest of
-							 * infrastructure using dsm segments.
-							 */
-							5 * MaxConnections,
+							INT_MAX,
 							PGC_POSTMASTER,
 							0,
 							NULL,
@@ -290,7 +292,7 @@ _PG_init(void)
 	 * resources in pgsp_shmem_startup().
 	 */
 	RequestAddinShmemSpace(pgsp_memsize());
-	RequestNamedLWLockTranche("pg_shared_plans", 1);
+	RequestNamedLWLockTranche(PGSP_TRANCHE_NAME, 1);
 
 	/* Install hooks */
 	prev_shmem_startup_hook = shmem_startup_hook;
@@ -314,7 +316,7 @@ _PG_fini(void)
 static void
 pgsp_shmem_startup(void)
 {
-	bool				found;
+	bool		found;
 	HASHCTL		info;
 
 	if (prev_shmem_startup_hook)
@@ -335,11 +337,33 @@ pgsp_shmem_startup(void)
 
 	if (!found)
 	{
+		int			trancheid;
+
 		/* First time through ... */
 		memset(pgsp, 0, sizeof(pgspSharedState));
-		pgsp->lock = &(GetNamedLWLockTranche("pg_shared_plans"))->lock;
+		pgsp->lock = &(GetNamedLWLockTranche(PGSP_TRANCHE_NAME))->lock;
+		pgsp->pgsp_dsa_handle = DSM_HANDLE_INVALID;
 		pgsp->cur_median_usage = ASSUMED_MEDIAN_INIT;
 		SpinLockInit(&pgsp->mutex);
+
+		/* try to guess our trancheid */
+		for (trancheid = LWTRANCHE_FIRST_USER_DEFINED; ; trancheid++)
+		{
+			if (strcmp(GetLWLockIdentifier(PG_WAIT_LWLOCK, trancheid),
+					   PGSP_TRANCHE_NAME) == 0)
+			{
+				/* Found it! */
+				break;
+			}
+			if ((trancheid - LWTRANCHE_FIRST_USER_DEFINED) > 50)
+			{
+				/* No point trying so hard, just give up. */
+				trancheid = LWTRANCHE_FIRST_USER_DEFINED;
+				break;
+			}
+		}
+		Assert(trancheid >= LWTRANCHE_FIRST_USER_DEFINED);
+		pgsp->LWTRANCHE_PGSP = trancheid;
 	}
 
 	info.keysize = sizeof(pgspHashKey);
@@ -375,6 +399,9 @@ pgsp_planner_hook(Query *parse,
 	if (!pgsp_enabled || parse->queryId == UINT64CONST(0) || boundParams == NULL)
 		goto fallback;
 
+	/* Create or attach to the dsa. */
+	pgsp_attach_dsa();
+
 	/* We need to create a per-user entry if there are RLS */
 	if (parse->hasRowSecurity)
 		key.userid = GetUserId();
@@ -401,19 +428,7 @@ pgsp_planner_hook(Query *parse,
 
 	if (entry)
 	{
-		dsm_segment *seg;
-		char *local;
-
-		Assert(entry->h != DSM_HANDLE_INVALID);
-
-		seg = dsm_attach(entry->h);
-		if (seg == NULL)
-		{
-			LWLockRelease(pgsp->lock);
-			goto fallback;
-		}
-
-		local = pgsp_get_plan(seg);
+		const char *local = pgsp_get_plan(entry->plan);
 
 		if (local != NULL)
 		{
@@ -425,7 +440,6 @@ pgsp_planner_hook(Query *parse,
 			{
 				result = (PlannedStmt *) stringToNode(local);
 
-				dsm_detach(seg);
 				LWLockRelease(pgsp->lock);
 				pgsp_acquire_executor_locks(result, true);
 
@@ -444,8 +458,6 @@ pgsp_planner_hook(Query *parse,
 			/* Should not happen. */
 			Assert(false);
 		}
-
-		dsm_detach(seg);
 	}
 
 	LWLockRelease(pgsp->lock);
@@ -513,10 +525,41 @@ fallback:
 								cursorOptions, boundParams);
 }
 
+/*
+ * Create the dynamic shared area or attach to it.
+ */
 static void
-pgsp_detach(dsm_segment *segment, Datum datum)
+pgsp_attach_dsa(void)
 {
-	elog(DEBUG1, "pgsp_detach");
+	MemoryContext	oldcontext;
+
+	Assert(!LWLockHeldByMe(pgsp->lock));
+
+	/* Nothing to do if we're already attached to the dsa. */
+	if (area != NULL)
+	{
+		Assert(pgsp->pgsp_dsa_handle != DSM_HANDLE_INVALID);
+		return;
+	}
+
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+
+	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+	if (pgsp->pgsp_dsa_handle == DSM_HANDLE_INVALID)
+	{
+		area = dsa_create(pgsp->LWTRANCHE_PGSP);
+		dsa_pin(area);
+		pgsp->pgsp_dsa_handle = dsa_get_handle(area);
+	}
+	else
+		area = dsa_attach(pgsp->pgsp_dsa_handle);
+
+	dsa_pin_mapping(area);
+	LWLockRelease(pgsp->lock);
+
+	MemoryContextSwitchTo(oldcontext);
+
+	Assert(area != NULL);
 }
 
 /* Release pgsp->lock that was acquired during pg_shared_plans(). */
@@ -624,20 +667,34 @@ pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire)
 	}
 }
 
-static dsm_segment *
-pgsp_allocate_plan(PlannedStmt *stmt, size_t *len, int *num_rels)
+static bool
+pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context)
 {
-	dsm_segment *seg;
-	shm_toc_estimator estimator;
-	shm_toc *toc;
 	char *local;
 	char *serialized;
-	size_t size, array_len;
 	List	*oids = NIL;
 	ListCell *lc;
 
+	Assert(!LWLockHeldByMe(pgsp->lock));
+	Assert(context->plan == InvalidDsaPointer);
+	Assert(context->rels == InvalidDsaPointer);
+	Assert(area != NULL);
+
+	/* First, allocate space to save a serialized version of the plan. */
 	serialized = nodeToString(stmt);
-	*len = strlen(serialized) + 1;
+	context->len = strlen(serialized) + 1;
+
+	context->plan = dsa_allocate_extended(area, context->len, DSA_ALLOC_NO_OOM);
+
+	/* If we couldn't allocate memory for the plan, inform caller. */
+	if (context->plan == InvalidDsaPointer)
+		return false;
+
+	local = dsa_get_address(area, context->plan);
+	Assert(local != NULL);
+
+	/* And copy the plan. */
+	memcpy(local, serialized, context->len);
 
 	/* Compute base relations the plan is referencing. */
 	foreach(lc, stmt->rtable)
@@ -651,47 +708,40 @@ pgsp_allocate_plan(PlannedStmt *stmt, size_t *len, int *num_rels)
 		Assert(OidIsValid(rte->relid));
 		oids = list_append_unique_oid(oids, rte->relid);
 	}
-	array_len = sizeof(Oid) * list_length(oids);
-	*num_rels = list_length(oids);
+	context->num_rels = list_length(oids);
 
-	shm_toc_initialize_estimator(&estimator);
-	shm_toc_estimate_keys(&estimator, 1);
-	shm_toc_estimate_chunk(&estimator, *len);
-	if (oids != NIL)
+	/* Save the list of relations in shared memory if any. */
+	if (list_length(oids) != 0)
 	{
-		Assert(array_len >= sizeof(Oid));
-		shm_toc_estimate_keys(&estimator, 1);
-		shm_toc_estimate_chunk(&estimator, array_len);
-	}
-	size = shm_toc_estimate(&estimator);
+		Oid	   *array;
+		size_t array_len;
+		int		i;
 
-	seg = dsm_create(size, DSM_CREATE_NULL_IF_MAXSEGMENTS);
+		Assert(oids != NIL);
 
-	/* out of memory */
-	if (!seg)
-	{
-		return NULL;
-	}
+		array_len = sizeof(Oid) * list_length(oids);
+		context->rels = dsa_allocate_extended(area, array_len, DSA_ALLOC_NO_OOM);
 
-	/* Save the serialized plan. */
-	toc = shm_toc_create(PGSP_MAGIC, dsm_segment_address(seg), size);
-	local = (char *) shm_toc_allocate(toc, *len);
-	memcpy(local, serialized, *len);
-	shm_toc_insert(toc, PGSP_PLAN_KEY, local);
+		/*
+		 * If we couldn't allocate memory for the rels, inform caller but only
+		 * after releasing the plan we just alloc'ed.
+		 */
+		if (context->plan == InvalidDsaPointer)
+		{
+			dsa_free(area, context->plan);
+			return false;
+		}
 
-	/* Save the list of Oids, if any. */
-	if (oids != NIL)
-	{
-		Oid *array = (Oid *) shm_toc_allocate(toc, array_len);
-		int i = 0;
+		array = dsa_get_address(area, context->rels);
 
+		i = 0;
 		foreach(lc, oids)
-			array[i++] = lfirst_oid(lc);
+				array[i++] = lfirst_oid(lc);
 
-		shm_toc_insert(toc, PGSP_REL_KEY, array);
+		Assert(i == list_length(oids));
 	}
 
-	return seg;
+	return true;
 }
 
 /*
@@ -710,7 +760,7 @@ pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats)
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
 
 	/* We should already have computed a custom plan */
-	Assert(e->generic_cost > 0 && e->len > 0 && e->h > 0 &&
+	Assert(e->generic_cost > 0 && e->len > 0 && e->plan != InvalidDsaPointer &&
 		   e->plantime > 0);
 
 	SpinLockAcquire(&e->mutex);
@@ -740,17 +790,14 @@ pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats)
 	return use_cached;
 }
 
-static char *
-pgsp_get_plan(dsm_segment *seg)
+static const char *
+pgsp_get_plan(dsa_pointer plan)
 {
-	shm_toc *toc;
+	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
+	Assert(plan != InvalidDsaPointer);
+	Assert(area != NULL);
 
-	Assert(seg);
-
-	toc = shm_toc_attach(PGSP_MAGIC, dsm_segment_address(seg));
-	Assert(toc);
-
-	return (char *) shm_toc_lookup(toc, PGSP_PLAN_KEY, true);
+	return (const char *) dsa_get_address(area, plan);
 }
 
 /*
@@ -761,31 +808,29 @@ static void
 pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic, pgspHashKey *key,
 				double plantime, int num_const)
 {
-	dsm_segment *seg;
+	pgspDsaContext context = {0};
 	pgspEntry *entry PG_USED_FOR_ASSERTS_ONLY;
-	size_t		len;
-	int			num_rels;
 
 	Assert(!LWLockHeldByMe(pgsp->lock));
 
 	/*
-	 * We store the plan is dsm before acquiring the lwlock.  It means that
-	 * we may have to discard it, but it avoids locking overhead.
+	 * We store the plan is shared memory before acquiring the lwlock.  It
+	 * means that we may have to free it, but it avoids locking overhead.
 	 */
-	seg = pgsp_allocate_plan(generic, &len, &num_rels);
-
-	/*
-	 * Don't try to allocate a new entry if we couldn't store the plan in
-	 * dsm.
-	 */
-	if (!seg)
+	if (!pgsp_allocate_plan(generic, &context))
+	{
+		/*
+		 * Don't try to allocate a new entry if we couldn't store the plan in
+		 * shared memory.
+		 */
 		return;
+	}
+
 
 	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-	entry = pgsp_entry_alloc(key, seg, len, plantime,
+	entry = pgsp_entry_alloc(key, &context, plantime, num_const,
 							 pgsp_cached_plan_cost(custom, true),
-							 pgsp_cached_plan_cost(generic, false),
-							 num_const, num_rels);
+							 pgsp_cached_plan_cost(generic, false));
 	Assert(entry);
 	LWLockRelease(pgsp->lock);
 }
@@ -838,18 +883,21 @@ pgsp_memsize(void)
 
 /*
  * Allocate a new hashtable entry if no one did the job before, and associate
- * it with the given dsm_segment that holds the generic plan for that entry.
- * Caller must hold an exclusive lock on pgsp->lock
+ * it with the given dsa_pointers that holds the generic plan (and the
+ * underlying relations if any) for that entry.  Caller must hold an exclusive
+ * lock on pgsp->lock
  */
 static pgspEntry *
-pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg, size_t len,
-		double plantime, Cost custom_cost, Cost generic_cost, int num_const,
-		int num_rels)
+pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
+				 int num_const, Cost custom_cost, Cost generic_cost)
 {
 	pgspEntry  *entry;
 	bool		found;
 
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
+	Assert(context->plan != InvalidDsaPointer);
+	Assert((context->num_rels == 0 && context->rels == InvalidDsaPointer) ||
+		   (context->num_rels > 0 && context->rels != InvalidDsaPointer));
 
 	/* Make space if needed */
 	while (hash_get_num_entries(pgsp_hash) >= pgsp_max)
@@ -861,29 +909,24 @@ pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg, size_t len,
 	if (!found)
 	{
 		/* New entry, initialize it */
-		entry->len = len;
+		entry->len = context->len;
+		entry->plan = context->plan;
+		entry->num_rels = context->num_rels;
+		entry->rels = context->rels;
+		entry->num_const = num_const;
 		entry->plantime = plantime;
+		entry->generic_cost = generic_cost;
+
+		/* re-initialize the mutex each time ... we assume no one using it */
+		SpinLockInit(&entry->mutex);
 		entry->bypass = 0;
 		entry->usage = PGSP_USAGE_INIT;
 		entry->total_custom_cost = custom_cost;
 		entry->num_custom_plans = 1.0;
-		entry->generic_cost = generic_cost;
-		entry->num_const = num_const;
-		entry->num_rels = num_rels;
-
-		/* re-initialize the mutex each time ... we assume no one using it */
-		SpinLockInit(&entry->mutex);
-
-		/* permanently store the given dsm segment */
-		entry->h = dsm_segment_handle(seg);
-		dsm_pin_segment(seg);
-		on_dsm_detach(seg, pgsp_detach, (Datum) 0);
-
-		dsm_detach(seg);
 	}
 
 	/* We should always have a valid handle */
-	Assert(entry->h != DSM_HANDLE_INVALID);
+	Assert(entry->plan != InvalidDsaPointer);
 
 	return entry;
 }
@@ -957,19 +1000,19 @@ pgsp_entry_dealloc(void)
 	}
 }
 
-/* Remove an entry from the hash table and deallocate dsm segment. */
+/* Remove an entry from the hash table and free associated dsa pointers. */
 static void
 pgsp_entry_remove(pgspEntry *entry)
 {
-	dsm_segment *seg;
-
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
+	Assert(area != NULL);
 
-	/* Free the dsm segment. */
-	seg = dsm_attach(entry->h);
-	Assert(seg);
-	dsm_unpin_segment(entry->h);
-	dsm_detach(seg);
+	/* Free the dsa allocated memory. */
+	Assert(entry->plan != InvalidDsaPointer);
+	dsa_free(area, entry->plan);
+
+	if (entry->rels != InvalidDsaPointer)
+		dsa_free(area, entry->rels);
 
 	/* And remove the hash entry. */
 	hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
@@ -1046,41 +1089,36 @@ entry_cmp(const void *lhs, const void *rhs)
 }
 
 static Datum
-do_showrels(dsm_segment *seg, int num_rels)
+do_showrels(dsa_pointer rels, int num_rels)
 {
-	Oid		   *array;
-	shm_toc	   *toc;
+	Oid		   *oids;
 	Datum	   *arrayelems;
 	int			i;
 
-	Assert(seg);
+	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
+	Assert(rels != InvalidDsaPointer);
 	Assert(num_rels > 0);
-
-	toc = shm_toc_attach(PGSP_MAGIC, dsm_segment_address(seg));
-	Assert(toc);
-
-	array = (Oid *) shm_toc_lookup(toc, PGSP_REL_KEY, true);
-	Assert(array);
+	Assert(area != NULL);
 
 	arrayelems = (Datum *) palloc(sizeof(Datum) * num_rels);
 
+	oids = (Oid *) dsa_get_address(area, rels);
+
 	for (i = 0; i < num_rels; i++)
-		arrayelems[i] = ObjectIdGetDatum(array[i]);
+		arrayelems[i] = ObjectIdGetDatum(oids[i]);
 
 	PG_RETURN_ARRAYTYPE_P(construct_array(arrayelems, num_rels, OIDOID,
 						  sizeof(Oid), true, TYPALIGN_INT));
 }
 
 static char *
-do_showplans(dsm_segment *seg)
+do_showplans(dsa_pointer plan)
 {
 	PlannedStmt *stmt;
 	ExplainState   *es = NewExplainState();
-	char *local;
+	const char *local;
 
-	Assert(seg);
-
-	local = pgsp_get_plan(seg);
+	local = pgsp_get_plan(plan);
 
 	if (!local)
 		return NULL;
@@ -1130,6 +1168,9 @@ pg_shared_plans_reset(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("pg_shared_plans must be loaded via shared_preload_libraries")));
+
+	/* Create or attach to the dsa. */
+	pgsp_attach_dsa();
 
 	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
 	num_entries = hash_get_num_entries(pgsp_hash);
@@ -1262,6 +1303,9 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		/* create a function context for cross-call persistence */
 		fctx = SRF_FIRSTCALL_INIT();
 
+		/* Create or attach to the dsa. */
+		pgsp_attach_dsa();
+
 		oldcontext = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
 
 		/* build tupdesc for result tuples */
@@ -1380,46 +1424,28 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		values[i++] = Float8GetDatumFast(generic_cost);
 		values[i++] = Int32GetDatum(entry->num_rels);
 
-		if (showplan || showrels)
+		if (showrels)
 		{
-			dsm_segment *seg;
-
-			seg = dsm_attach(entry->h);
-			if (seg == NULL) /* should not happen */
-			{
+			if (entry->num_rels == 0)
 				nulls[i++] = true;
-				values[i++] = CStringGetTextDatum("<no dsm_segment>");
-			}
 			else
-			{
-				if (showrels)
-				{
-					if (entry->num_rels == 0)
-						nulls[i++] = true;
-					else
-						values[i++] = do_showrels(seg, entry->num_rels);
-				}
-				else
-					nulls[i++] = true;
-				if (showplan)
-				{
-					char *local = do_showplans(seg);
-
-					if (local)
-						values[i++] = CStringGetTextDatum(local);
-					else
-						values[i++] = CStringGetTextDatum("<no toc>");
-				}
-				else
-					nulls[i++] = true;
-			}
-			dsm_detach(seg);
+				values[i++] = do_showrels(entry->rels, entry->num_rels);
 		}
 		else
+			nulls[i++] = true;
+
+		if (showplan)
 		{
-			nulls[i++] = true;
-			nulls[i++] = true;
+			char *local = do_showplans(entry->plan);
+
+			if (local)
+				values[i++] = CStringGetTextDatum(local);
+			else
+				values[i++] = CStringGetTextDatum("<no toc>");
 		}
+		else
+			nulls[i++] = true;
+
 		Assert(i == PG_SHARED_PLANS_COLS);
 
 		tuple = heap_form_tuple(fctx->tuple_desc, values, nulls);
