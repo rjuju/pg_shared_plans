@@ -179,6 +179,23 @@ FROM public.pg_shared_plans_detailed pgsp
 WHERE query LIKE '%mysecretdata%'
 ORDER BY rolname COLLATE "C" ASC;
 
+--
+-- temp table
+--
+CREATE TEMPORARY TABLE mytemp(id integer);
+PREPARE mytemp(int) AS SELECT * FROM mytemp WHERE id = $1;
+
+-- Should not add the query in shared cache
+EXECUTE mytemp(1);
+
+-- Should not find any entry
+SELECT rolname, bypass, num_custom_plans,
+    plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
+    generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
+FROM public.pg_shared_plans_detailed pgsp
+WHERE query LIKE '%mytemp%'
+ORDER BY rolname COLLATE "C" ASC;
+
 DROP TABLE mysecretdata CASCADE;
 DROP ROLE regress_a;
 DROP ROLE regress_b;

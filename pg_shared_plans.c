@@ -13,6 +13,7 @@
 
 #include "postgres.h"
 
+#include "access/relation.h"
 #include "commands/explain.h"
 #include "common/hashfn.h"
 #include "executor/spi.h"
@@ -363,7 +364,13 @@ pgsp_planner_hook(Query *parse,
 	/* Found unhandled nodes, don't try to cache the plan. */
 	context.constid = 0;
 	context.numconst = 0;
-	pgsp_query_walker((Node *) parse, &context);
+	/*
+	 * Ignore if then plan is not cacheable (e.g. contains a temp table
+	 * reference)
+	 */
+	if (pgsp_query_walker((Node *) parse, &context))
+		goto fallback;
+
 	key.constid = context.constid;
 
 	/* Lookup the hash table entry with shared lock. */
@@ -895,6 +902,24 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 	if (IsA(node, Query))
 	{
 		Query *query = (Query *) node;
+		ListCell *lc;
+
+		foreach(lc, query->rtable)
+		{
+			RangeTblEntry *entry = lfirst_node(RangeTblEntry, lc);
+
+			if (entry->rtekind == RTE_RELATION)
+			{
+				Relation rel = relation_open(entry->relid, AccessShareLock);
+				bool is_temp;
+
+				is_temp = RelationUsesLocalBuffers(rel);
+				relation_close(rel, NoLock);
+
+				if (is_temp)
+					return true;
+			}
+		}
 
 		return query_tree_walker(query, pgsp_query_walker, context, 0);
 	}
