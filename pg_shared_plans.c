@@ -42,6 +42,7 @@ PG_MODULE_MAGIC;
 
 #define PGSP_MAGIC				0x20210318
 #define PGSP_PLAN_KEY			UINT64CONST(1)
+#define PGSP_REL_KEY			UINT64CONST(2)
 #define PGSP_USAGE_INIT			(1.0)
 #define ASSUMED_MEDIAN_INIT		(10.0)	/* initial assumed median usage */
 #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every entry_dealloc */
@@ -58,22 +59,23 @@ typedef struct pgspHashKey
 typedef struct pgspEntry
 {
 	pgspHashKey key;		/* hash key of entry - MUST BE FIRST */
-	dsm_handle  h;			/* Only modified holding exclusive pgsp->lock */
+	dsm_handle  h;			/* only modified holding exclusive pgsp->lock */
 	size_t		len;		/* serialized plan length */
 	double		plantime;	/* first generic planning time */
-	Cost		generic_cost;
-	int			numconst;
+	Cost		generic_cost; /* total cost of the stored plan */
+	int			num_const;	/* # of const values in the plan */
+	int			num_rels;	/* # of referenced base relations */
 	slock_t		mutex;		/* protects following fields only */
 	int64		bypass;		/* number of times magic happened */
 	double		usage;		/* usage factor */
-	Cost		total_custom_cost;
-	int64		num_custom_plans;
+	Cost		total_custom_cost; /* total cost of custom plans planned */
+	int64		num_custom_plans; /* # of custom plans planned */
 } pgspEntry;
 
 typedef struct pgspWalkerContext
 {
 	uint32	constid;
-	int		numconst;
+	int		num_const;
 } pgspWalkerContext;
 
 /*
@@ -137,21 +139,24 @@ static void pg_shared_plans_shutdown(Datum arg);
 
 static void pgsp_accum_custom_plan(pgspHashKey *key, Cost cost);
 static void pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire);
-static dsm_segment *pgsp_allocate_plan(PlannedStmt *stmt, size_t *len);
+static dsm_segment *pgsp_allocate_plan(PlannedStmt *stmt, size_t *len,
+									   int *num_rels);
 static bool pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats);
 static char *pgsp_get_plan(dsm_segment *seg);
 static void pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic,
-		pgspHashKey *key, double plantime, int numconst);
+		pgspHashKey *key, double plantime, int num_const);
 static uint32 pgsp_hash_fn(const void *key, Size keysize);
 static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
 static Size pgsp_memsize(void);
 static pgspEntry *pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg,
 		size_t len, double plantime, Cost custom_cost, Cost generic_cost,
-		int numconst);
+		int num_const, int num_rels);
 static void pgsp_entry_dealloc(void);
 static void pgsp_entry_remove(pgspEntry *entry);
 static bool pgsp_query_walker(Node *node, pgspWalkerContext *context);
 static int entry_cmp(const void *lhs, const void *rhs);
+static Datum do_showrels(dsm_segment *seg, int num_rels);
+static char *do_showplans(dsm_segment *seg);
 
 
 /*
@@ -363,7 +368,7 @@ pgsp_planner_hook(Query *parse,
 
 	/* Found unhandled nodes, don't try to cache the plan. */
 	context.constid = 0;
-	context.numconst = 0;
+	context.num_const = 0;
 	/*
 	 * Ignore if then plan is not cacheable (e.g. contains a temp table
 	 * reference)
@@ -445,7 +450,7 @@ pgsp_planner_hook(Query *parse,
 		/* Generate a generic plan */
 		generic = standard_planner(generic_parse, query_string, cursorOptions,
 								   NULL);
-		pgsp_cache_plan(result, generic, &key, plantime, context.numconst);
+		pgsp_cache_plan(result, generic, &key, plantime, context.num_const);
 	}
 	else if (accum_custom_stats)
 	{
@@ -572,21 +577,44 @@ pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire)
 }
 
 static dsm_segment *
-pgsp_allocate_plan(PlannedStmt *stmt, size_t *len)
+pgsp_allocate_plan(PlannedStmt *stmt, size_t *len, int *num_rels)
 {
 	dsm_segment *seg;
 	shm_toc_estimator estimator;
 	shm_toc *toc;
 	char *local;
 	char *serialized;
-	size_t size;
+	size_t size, array_len;
+	List	*oids = NIL;
+	ListCell *lc;
 
 	serialized = nodeToString(stmt);
 	*len = strlen(serialized) + 1;
 
+	/* Compute base relations the plan is referencing. */
+	foreach(lc, stmt->rtable)
+	{
+		RangeTblEntry  *rte = lfirst_node(RangeTblEntry, lc);
+
+		/* We only need to add dependency for real relations. */
+		if (rte->rtekind != RTE_RELATION)
+			continue;
+
+		Assert(OidIsValid(rte->relid));
+		oids = list_append_unique_oid(oids, rte->relid);
+	}
+	array_len = sizeof(Oid) * list_length(oids);
+	*num_rels = list_length(oids);
+
 	shm_toc_initialize_estimator(&estimator);
 	shm_toc_estimate_keys(&estimator, 1);
 	shm_toc_estimate_chunk(&estimator, *len);
+	if (oids != NIL)
+	{
+		Assert(array_len >= sizeof(Oid));
+		shm_toc_estimate_keys(&estimator, 1);
+		shm_toc_estimate_chunk(&estimator, array_len);
+	}
 	size = shm_toc_estimate(&estimator);
 
 	seg = dsm_create(size, DSM_CREATE_NULL_IF_MAXSEGMENTS);
@@ -597,10 +625,23 @@ pgsp_allocate_plan(PlannedStmt *stmt, size_t *len)
 		return NULL;
 	}
 
+	/* Save the serialized plan. */
 	toc = shm_toc_create(PGSP_MAGIC, dsm_segment_address(seg), size);
 	local = (char *) shm_toc_allocate(toc, *len);
 	memcpy(local, serialized, *len);
 	shm_toc_insert(toc, PGSP_PLAN_KEY, local);
+
+	/* Save the list of Oids, if any. */
+	if (oids != NIL)
+	{
+		Oid *array = (Oid *) shm_toc_allocate(toc, array_len);
+		int i = 0;
+
+		foreach(lc, oids)
+			array[i++] = lfirst_oid(lc);
+
+		shm_toc_insert(toc, PGSP_REL_KEY, array);
+	}
 
 	return seg;
 }
@@ -670,11 +711,12 @@ pgsp_get_plan(dsm_segment *seg)
  */
 static void
 pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic, pgspHashKey *key,
-				double plantime, int numconst)
+				double plantime, int num_const)
 {
 	dsm_segment *seg;
 	pgspEntry *entry PG_USED_FOR_ASSERTS_ONLY;
 	size_t		len;
+	int			num_rels;
 
 	Assert(!LWLockHeldByMe(pgsp->lock));
 
@@ -682,7 +724,7 @@ pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic, pgspHashKey *key,
 	 * We store the plan is dsm before acquiring the lwlock.  It means that
 	 * we may have to discard it, but it avoids locking overhead.
 	 */
-	seg = pgsp_allocate_plan(generic, &len);
+	seg = pgsp_allocate_plan(generic, &len, &num_rels);
 
 	/*
 	 * Don't try to allocate a new entry if we couldn't store the plan in
@@ -695,7 +737,7 @@ pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic, pgspHashKey *key,
 	entry = pgsp_entry_alloc(key, seg, len, plantime,
 							 pgsp_cached_plan_cost(custom, true),
 							 pgsp_cached_plan_cost(generic, false),
-							 numconst);
+							 num_const, num_rels);
 	Assert(entry);
 	LWLockRelease(pgsp->lock);
 }
@@ -753,7 +795,8 @@ pgsp_memsize(void)
  */
 static pgspEntry *
 pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg, size_t len,
-		double plantime, Cost custom_cost, Cost generic_cost, int numconst)
+		double plantime, Cost custom_cost, Cost generic_cost, int num_const,
+		int num_rels)
 {
 	pgspEntry  *entry;
 	bool		found;
@@ -777,7 +820,8 @@ pgsp_entry_alloc(pgspHashKey *key, dsm_segment *seg, size_t len,
 		entry->total_custom_cost = custom_cost;
 		entry->num_custom_plans = 1.0;
 		entry->generic_cost = generic_cost;
-		entry->numconst = numconst;
+		entry->num_const = num_const;
+		entry->num_rels = num_rels;
 
 		/* re-initialize the mutex each time ... we assume no one using it */
 		SpinLockInit(&entry->mutex);
@@ -930,7 +974,7 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 
 		context->constid = hash_combine(context->constid,
 										hash_any((unsigned char *) r, len));
-		context->numconst++;
+		context->num_const++;
 	}
 
 	return expression_tree_walker(node, pgsp_query_walker, context);
@@ -951,6 +995,65 @@ entry_cmp(const void *lhs, const void *rhs)
 		return +1;
 	else
 		return 0;
+}
+
+static Datum
+do_showrels(dsm_segment *seg, int num_rels)
+{
+	Oid		   *array;
+	shm_toc	   *toc;
+	Datum	   *arrayelems;
+	int			i;
+
+	Assert(seg);
+	Assert(num_rels > 0);
+
+	toc = shm_toc_attach(PGSP_MAGIC, dsm_segment_address(seg));
+	Assert(toc);
+
+	array = (Oid *) shm_toc_lookup(toc, PGSP_REL_KEY, true);
+	Assert(array);
+
+	arrayelems = (Datum *) palloc(sizeof(Datum) * num_rels);
+
+	for (i = 0; i < num_rels; i++)
+		arrayelems[i] = ObjectIdGetDatum(array[i]);
+
+	PG_RETURN_ARRAYTYPE_P(construct_array(arrayelems, num_rels, OIDOID,
+						  sizeof(Oid), true, TYPALIGN_INT));
+}
+
+static char *
+do_showplans(dsm_segment *seg)
+{
+	PlannedStmt *stmt;
+	ExplainState   *es = NewExplainState();
+	char *local;
+
+	Assert(seg);
+
+	local = pgsp_get_plan(seg);
+
+	if (!local)
+		return NULL;
+
+	es->analyze = false;
+	es->costs = pgsp_es_costs;
+	es->verbose = pgsp_es_verbose;
+	es->buffers = false;
+	es->wal = false;
+	es->timing = false;
+	es->summary = false;
+	es->format = pgsp_es_format;
+
+	stmt = (PlannedStmt *) stringToNode(local);
+
+	pgsp_acquire_executor_locks(stmt, true);
+	ExplainBeginOutput(es);
+	ExplainOnePlan(stmt, NULL, es, "", NULL, NULL, NULL, NULL);
+	pgsp_acquire_executor_locks(stmt, false);
+
+	return es->str->data;
 }
 
 Datum
@@ -1081,7 +1184,7 @@ pg_shared_plans_info(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
-#define PG_SHARED_PLANS_COLS			12
+#define PG_SHARED_PLANS_COLS			14
 Datum
 pg_shared_plans(PG_FUNCTION_ARGS)
 {
@@ -1090,7 +1193,8 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		bool			showplan;
 		HASH_SEQ_STATUS hash_seq;
 	} *state;
-	bool		showplan = PG_GETARG_BOOL(0);
+	bool		showrels = PG_GETARG_BOOL(0);
+	bool		showplan = PG_GETARG_BOOL(1);
 	FuncCallContext *fctx;
 	pgspEntry  *entry;
 
@@ -1117,7 +1221,7 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 						   INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "constid",
 						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "numconst",
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "num_const",
 						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "bypass",
 						   INT8OID, -1, 0);
@@ -1131,6 +1235,10 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 						   INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "generic_cost",
 						   FLOAT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "num_relations",
+						   INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "relations",
+						   OIDARRAYOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "plans",
 						   TEXTOID, -1, 0);
 
@@ -1209,55 +1317,56 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 			values[i++] = ObjectIdGetDatum(entry->key.constid);
 		else
 			nulls[i++] = true;
-		values[i++] = Int32GetDatum(entry->numconst);
+		values[i++] = Int32GetDatum(entry->num_const);
 		values[i++] = Int64GetDatumFast(bypass);
 		values[i++] = Int64GetDatumFast(len);
 		values[i++] = Float8GetDatumFast(plantime);
 		values[i++] = Float8GetDatumFast(total_custom_cost);
 		values[i++] = Int64GetDatumFast(num_custom_plans);
 		values[i++] = Float8GetDatumFast(generic_cost);
+		values[i++] = Int32GetDatum(entry->num_rels);
 
-		if (showplan)
+		if (showplan || showrels)
 		{
-			ExplainState   *es = NewExplainState();
 			dsm_segment *seg;
-			char *local;
-
-			es->analyze = false;
-			es->costs = pgsp_es_costs;
-			es->verbose = pgsp_es_verbose;
-			es->buffers = false;
-			es->wal = false;
-			es->timing = false;
-			es->summary = false;
-			es->format = pgsp_es_format;
 
 			seg = dsm_attach(entry->h);
-			if (seg == NULL)
+			if (seg == NULL) /* should not happen */
+			{
+				nulls[i++] = true;
 				values[i++] = CStringGetTextDatum("<no dsm_segment>");
+			}
 			else
 			{
-				local = pgsp_get_plan(seg);
-
-				if (local)
+				if (showrels)
 				{
-					PlannedStmt *stmt = (PlannedStmt *) stringToNode(local);
-					pgsp_acquire_executor_locks(stmt, true);
-					ExplainBeginOutput(es);
-					ExplainOnePlan(stmt,
-							NULL, es, "", NULL, NULL, NULL, NULL);
-					pgsp_acquire_executor_locks(stmt, false);
-					values[i++] = CStringGetTextDatum(es->str->data);
-					//values[i++] = CStringGetTextDatum(local);
+					if (entry->num_rels == 0)
+						nulls[i++] = true;
+					else
+						values[i++] = do_showrels(seg, entry->num_rels);
 				}
 				else
-					values[i++] = CStringGetTextDatum("<no toc>");
+					nulls[i++] = true;
+				if (showplan)
+				{
+					char *local = do_showplans(seg);
 
-				dsm_detach(seg);
+					if (local)
+						values[i++] = CStringGetTextDatum(local);
+					else
+						values[i++] = CStringGetTextDatum("<no toc>");
+				}
+				else
+					nulls[i++] = true;
 			}
+			dsm_detach(seg);
 		}
 		else
+		{
 			nulls[i++] = true;
+			nulls[i++] = true;
+		}
+		Assert(i == PG_SHARED_PLANS_COLS);
 
 		tuple = heap_form_tuple(fctx->tuple_desc, values, nulls);
 		SRF_RETURN_NEXT(fctx, HeapTupleGetDatum(tuple));

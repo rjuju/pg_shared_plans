@@ -72,16 +72,16 @@ EXECUTE slow2(0);
 
 -- Check that the plan is saved, planned once, used 4 times, with no dependency
 -- on role
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%pg_class c%';
- rolname | bypass | num_custom_plans | has_plantime | has_size | has_generic_cost |      plan_extract      
----------+--------+------------------+--------------+----------+------------------+------------------------
-         |      4 |                1 | t            | t        | t                | Aggregate             +
-         |        |                  |              |          |                  |   ->  Nested Loop     +
-         |        |                  |              |          |                  |         ->  Nested Loo
+ rolname | bypass | num_custom_plans | nb_rels | has_plantime | has_size | has_generic_cost |      plan_extract      
+---------+--------+------------------+---------+--------------+----------+------------------+------------------------
+         |      4 |                1 |       1 | t            | t        | t                | Aggregate             +
+         |        |                  |         |              |          |                  |   ->  Nested Loop     +
+         |        |                  |         |              |          |                  |         ->  Nested Loo
 (1 row)
 
 -- should not be cached as planning time should be too fast
@@ -97,14 +97,64 @@ execute fast(1);
     2
 (1 row)
 
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%+%';
- rolname | bypass | num_custom_plans | has_plantime | has_size | has_generic_cost | plan_extract 
----------+--------+------------------+--------------+----------+------------------+--------------
+ rolname | bypass | num_custom_plans | nb_rels | has_plantime | has_size | has_generic_cost | plan_extract 
+---------+--------+------------------+---------+--------------+----------+------------------+--------------
 (0 rows)
+
+-- Test all SRFs
+SELECT count(*) FROM pg_shared_plans(false, false);
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM pg_shared_plans(false, true);
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM pg_shared_plans(true, false);
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM pg_shared_plans(true, true);
+ count 
+-------
+     1
+(1 row)
+
+-- Test correct behavior when there are no source relation */
+set pg_shared_plans.min_plan_time = '0ms';
+EXECUTE fast(1);
+ fast 
+------
+    2
+(1 row)
+
+EXECUTE fast(1);
+ fast 
+------
+    2
+(1 row)
+
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
+    plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
+    generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
+FROM public.pg_shared_plans_all pgsp
+WHERE query LIKE '%+%';
+ rolname | bypass | num_custom_plans | nb_rels | has_plantime | has_size | has_generic_cost | plan_extract 
+---------+--------+------------------+---------+--------------+----------+------------------+--------------
+         |      1 |                1 |         | t            | t        | t                | Result      +
+         |        |                  |         |              |          |                  | 
+(1 row)
 
 --
 -- Test correct behavior with search_path changes
@@ -147,19 +197,19 @@ EXECUTE ns(1);
 
 -- should find two identical rows for the two added plans, each planed and
 -- bypassed once, without dependency on role
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%mytable%';
- rolname | bypass | num_custom_plans | has_plantime | has_size | has_generic_cost |    plan_extract     
----------+--------+------------------+--------------+----------+------------------+---------------------
-         |      1 |                1 | t            | t        | t                | Seq Scan on mytable+
-         |        |                  |              |          |                  |   Filter: (id = $1)+
-         |        |                  |              |          |                  | 
-         |      1 |                1 | t            | t        | t                | Seq Scan on mytable+
-         |        |                  |              |          |                  |   Filter: (id = $1)+
-         |        |                  |              |          |                  | 
+ rolname | bypass | num_custom_plans | nb_rels | has_plantime | has_size | has_generic_cost |    plan_extract     
+---------+--------+------------------+---------+--------------+----------+------------------+---------------------
+         |      1 |                1 |       1 | t            | t        | t                | Seq Scan on mytable+
+         |        |                  |         |              |          |                  |   Filter: (id = $1)+
+         |        |                  |         |              |          |                  | 
+         |      1 |                1 |       1 | t            | t        | t                | Seq Scan on mytable+
+         |        |                  |         |              |          |                  |   Filter: (id = $1)+
+         |        |                  |         |              |          |                  | 
 (2 rows)
 
 --------------------------------------------
@@ -202,20 +252,20 @@ EXECUTE limit_b(1);
 (2 rows)
 
 -- Should find two entries, queries containing const values
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     constid != 0 AS has_constid, numconst,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%small%';
- rolname | bypass | num_custom_plans | has_constid | numconst | has_plantime | has_size | has_generic_cost |      plan_extract       
----------+--------+------------------+-------------+----------+--------------+----------+------------------+-------------------------
-         |      1 |                1 | t           |        1 | t            | t        | t                | Limit                  +
-         |        |                  |             |          |              |          |                  |   ->  Seq Scan on small+
-         |        |                  |             |          |              |          |                  |         Filter: (id 
-         |      1 |                1 | t           |        1 | t            | t        | t                | Limit                  +
-         |        |                  |             |          |              |          |                  |   ->  Seq Scan on small+
-         |        |                  |             |          |              |          |                  |         Filter: (id 
+ rolname | bypass | num_custom_plans | nb_rels | has_constid | numconst | has_plantime | has_size | has_generic_cost |      plan_extract       
+---------+--------+------------------+---------+-------------+----------+--------------+----------+------------------+-------------------------
+         |      1 |                1 |       1 | t           |        1 | t            | t        | t                | Limit                  +
+         |        |                  |         |             |          |              |          |                  |   ->  Seq Scan on small+
+         |        |                  |         |             |          |              |          |                  |         Filter: (id 
+         |      1 |                1 |       1 | t           |        1 | t            | t        | t                | Limit                  +
+         |        |                  |         |             |          |              |          |                  |   ->  Seq Scan on small+
+         |        |                  |         |             |          |              |          |                  |         Filter: (id 
 (2 rows)
 
 CREATE TABLE another AS SELECT 1 AS id, 'val' AS val;
@@ -248,22 +298,22 @@ EXECUTE where_b(1);
 (1 row)
 
 -- Should find two entries, queries containing const values
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     constid != 0 AS has_constid, numconst,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%another%';
- rolname | bypass | num_custom_plans | has_constid | numconst | has_plantime | has_size | has_generic_cost |    plan_extract    
----------+--------+------------------+-------------+----------+--------------+----------+------------------+--------------------
-         |      1 |                1 | t           |        2 | t            | t        | t                | Aggregate         +
-         |        |                  |             |          |              |          |                  |   ->  Append      +
-         |        |                  |             |          |              |          |                  |         ->  Result+
-         |        |                  |             |          |              |          |                  |         
-         |      1 |                1 | t           |        2 | t            | t        | t                | Aggregate         +
-         |        |                  |             |          |              |          |                  |   ->  Append      +
-         |        |                  |             |          |              |          |                  |         ->  Result+
-         |        |                  |             |          |              |          |                  |         
+ rolname | bypass | num_custom_plans | nb_rels | has_constid | numconst | has_plantime | has_size | has_generic_cost |    plan_extract    
+---------+--------+------------------+---------+-------------+----------+--------------+----------+------------------+--------------------
+         |      1 |                1 |       1 | t           |        2 | t            | t        | t                | Aggregate         +
+         |        |                  |         |             |          |              |          |                  |   ->  Append      +
+         |        |                  |         |             |          |              |          |                  |         ->  Result+
+         |        |                  |         |             |          |              |          |                  |         
+         |      1 |                1 |       1 | t           |        2 | t            | t        | t                | Aggregate         +
+         |        |                  |         |             |          |              |          |                  |   ->  Append      +
+         |        |                  |         |             |          |              |          |                  |         ->  Result+
+         |        |                  |         |             |          |              |          |                  |         
 (2 rows)
 
 --
@@ -323,21 +373,21 @@ EXECUTE rls(10);
 (1 row)
 
 RESET role;
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%mysecretdata%'
 ORDER BY rolname COLLATE "C" ASC;
-  rolname  | bypass | num_custom_plans | has_plantime | has_size | has_generic_cost |       plan_extract        
------------+--------+------------------+--------------+----------+------------------+---------------------------
- regress_a |      1 |                1 | t            | t        | t                | Seq Scan on mysecretdata +
-           |        |                  |              |          |                  |   Filter: ((val < $1) AND
- regress_b |      1 |                1 | t            | t        | t                | Seq Scan on mysecretdata +
-           |        |                  |              |          |                  |   Filter: ((val < $1) AND
- regress_c |      1 |                1 | t            | t        | t                | Seq Scan on mysecretdata +
-           |        |                  |              |          |                  |   Filter: (val < $1)     +
-           |        |                  |              |          |                  | 
+  rolname  | bypass | num_custom_plans | nb_rels | has_plantime | has_size | has_generic_cost |       plan_extract        
+-----------+--------+------------------+---------+--------------+----------+------------------+---------------------------
+ regress_a |      1 |                1 |       1 | t            | t        | t                | Seq Scan on mysecretdata +
+           |        |                  |         |              |          |                  |   Filter: ((val < $1) AND
+ regress_b |      1 |                1 |       1 | t            | t        | t                | Seq Scan on mysecretdata +
+           |        |                  |         |              |          |                  |   Filter: ((val < $1) AND
+ regress_c |      1 |                1 |       1 | t            | t        | t                | Seq Scan on mysecretdata +
+           |        |                  |         |              |          |                  |   Filter: (val < $1)     +
+           |        |                  |         |              |          |                  | 
 (3 rows)
 
 --
@@ -352,14 +402,14 @@ EXECUTE mytemp(1);
 (0 rows)
 
 -- Should not find any entry
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%mytemp%'
 ORDER BY rolname COLLATE "C" ASC;
- rolname | bypass | num_custom_plans | has_plantime | has_size | has_generic_cost | plan_extract 
----------+--------+------------------+--------------+----------+------------------+--------------
+ rolname | bypass | num_custom_plans | nb_rels | has_plantime | has_size | has_generic_cost | plan_extract 
+---------+--------+------------------+---------+--------------+----------+------------------+--------------
 (0 rows)
 
 DROP TABLE mysecretdata CASCADE;

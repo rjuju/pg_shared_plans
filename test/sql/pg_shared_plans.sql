@@ -51,20 +51,36 @@ EXECUTE slow2(0);
 
 -- Check that the plan is saved, planned once, used 4 times, with no dependency
 -- on role
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%pg_class c%';
 
 -- should not be cached as planning time should be too fast
 execute fast(1);
 execute fast(1);
 
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
+WHERE query LIKE '%+%';
+
+-- Test all SRFs
+SELECT count(*) FROM pg_shared_plans(false, false);
+SELECT count(*) FROM pg_shared_plans(false, true);
+SELECT count(*) FROM pg_shared_plans(true, false);
+SELECT count(*) FROM pg_shared_plans(true, true);
+
+-- Test correct behavior when there are no source relation */
+set pg_shared_plans.min_plan_time = '0ms';
+EXECUTE fast(1);
+EXECUTE fast(1);
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
+    plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
+    generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%+%';
 
 --
@@ -91,10 +107,10 @@ EXECUTE ns(1);
 
 -- should find two identical rows for the two added plans, each planed and
 -- bypassed once, without dependency on role
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%mytable%';
 
 --------------------------------------------
@@ -119,11 +135,11 @@ EXECUTE limit_b(1);
 EXECUTE limit_b(1);
 
 -- Should find two entries, queries containing const values
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     constid != 0 AS has_constid, numconst,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%small%';
 
 CREATE TABLE another AS SELECT 1 AS id, 'val' AS val;
@@ -137,11 +153,11 @@ EXECUTE where_a(1);
 EXECUTE where_b(1);
 EXECUTE where_b(1);
 -- Should find two entries, queries containing const values
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     constid != 0 AS has_constid, numconst,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%another%';
 
 --
@@ -172,10 +188,10 @@ EXECUTE rls(10);
 EXECUTE rls(10);
 
 RESET role;
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%mysecretdata%'
 ORDER BY rolname COLLATE "C" ASC;
 
@@ -189,10 +205,10 @@ PREPARE mytemp(int) AS SELECT * FROM mytemp WHERE id = $1;
 EXECUTE mytemp(1);
 
 -- Should not find any entry
-SELECT rolname, bypass, num_custom_plans,
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
-FROM public.pg_shared_plans_detailed pgsp
+FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%mytemp%'
 ORDER BY rolname COLLATE "C" ASC;
 
