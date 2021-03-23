@@ -770,9 +770,14 @@ pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats)
 
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
 
-	/* We should already have computed a custom plan */
-	Assert(e->generic_cost > 0 && e->len > 0 && e->plan != InvalidDsaPointer &&
-		   e->plantime > 0);
+	/*
+	 * We should already have computed a custom plan, and other immutable
+	 * fields values.
+	 * NOTE: A plan can have a zero cost, if it's Result with a One-Time
+	 * Filter: false
+	 */
+	Assert(e->generic_cost >= 0 && e->len > 0 && e->plan != InvalidDsaPointer
+		   && e->plantime > 0);
 
 	SpinLockAcquire(&e->mutex);
 
