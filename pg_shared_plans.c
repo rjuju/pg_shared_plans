@@ -456,6 +456,8 @@ pgsp_planner_hook(Query *parse,
 				 */
 				result->planTree->total_cost -= (1000.0 * cpu_operator_cost
 						* (list_length(result->rtable) + 1) + 10);
+				if (result->planTree->total_cost <= 0.0)
+					result->planTree->total_cost = 0.1;
 
 				return result;
 			}
