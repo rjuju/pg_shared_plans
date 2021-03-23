@@ -406,6 +406,9 @@ pgsp_planner_hook(Query *parse,
 	if (!pgsp_enabled || parse->queryId == UINT64CONST(0) || boundParams == NULL)
 		goto fallback;
 
+	if (parse->utilityStmt != NULL)
+		goto fallback;
+
 	/* Create or attach to the dsa. */
 	pgsp_attach_dsa();
 
