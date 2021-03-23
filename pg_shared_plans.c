@@ -100,6 +100,13 @@ typedef struct pgspWalkerContext
 	int		num_const;
 } pgspWalkerContext;
 
+
+typedef struct pgspSrfState
+{
+	HASH_SEQ_STATUS hash_seq;
+	bool			hash_seq_term_called;
+} pgspSrfState;
+
 /*
  * Global shared state
  */
@@ -566,8 +573,12 @@ pgsp_attach_dsa(void)
 static void
 pg_shared_plans_shutdown(Datum arg)
 {
+	pgspSrfState *state = (pgspSrfState *) DatumGetPointer(arg);
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
+	if (!state->hash_seq_term_called)
+		hash_seq_term(&state->hash_seq);
 	LWLockRelease(pgsp->lock);
+	pfree(state);
 }
 
 /*
@@ -1283,11 +1294,7 @@ pg_shared_plans_info(PG_FUNCTION_ARGS)
 Datum
 pg_shared_plans(PG_FUNCTION_ARGS)
 {
-	struct
-	{
-		bool			showplan;
-		HASH_SEQ_STATUS hash_seq;
-	} *state;
+	pgspSrfState *state;
 	bool		showrels = PG_GETARG_BOOL(0);
 	bool		showplan = PG_GETARG_BOOL(1);
 	FuncCallContext *fctx;
@@ -1343,8 +1350,8 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		Assert(i == PG_SHARED_PLANS_COLS + 1);
 		fctx->tuple_desc = BlessTupleDesc(tupdesc);
 
-		state = palloc(sizeof(*state));
-		state->showplan = PG_GETARG_BOOL(0);
+		state = MemoryContextAlloc(TopMemoryContext, sizeof(pgspSrfState));
+		memset(state, 0, sizeof(pgspSrfState));
 
 		MemoryContextSwitchTo(oldcontext);
 
@@ -1365,9 +1372,11 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 
 		RegisterExprContextCallback(rsi->econtext,
 				pg_shared_plans_shutdown,
-				(Datum) 0);
+				PointerGetDatum(state));
 
+		oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 		hash_seq_init(&state->hash_seq, pgsp_hash);
+		MemoryContextSwitchTo(oldcontext);
 	}
 
 	fctx = SRF_PERCALL_SETUP();
@@ -1451,6 +1460,8 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		tuple = heap_form_tuple(fctx->tuple_desc, values, nulls);
 		SRF_RETURN_NEXT(fctx, HeapTupleGetDatum(tuple));
 	}
+	else
+		state->hash_seq_term_called = true;
 
 	/* LWLockRelease will be called in pg_shared_plans_shutdown(). */
 
