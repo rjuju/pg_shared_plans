@@ -501,7 +501,7 @@ pgsp_planner_hook(Query *parse,
 	}
 
 	/* Save the plan if no one did it yet */
-	if (!entry && plantime > pgsp_min_plantime)
+	if (!entry && plantime >= pgsp_min_plantime)
 	{
 		/* Generate a generic plan */
 		generic = standard_planner(generic_parse,
