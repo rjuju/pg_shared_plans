@@ -627,10 +627,6 @@ static void
 pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire)
 {
 	ListCell   *lc2;
-#if PG_VERSION_NUM >= 140000
-	Index		rti,
-				resultRelation = 0;
-#endif
 
 	if (plannedstmt->commandType == CMD_UTILITY)
 	{
@@ -648,11 +644,6 @@ pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire)
 		return;
 	}
 
-#if PG_VERSION_NUM >= 140000
-	rti = 1;
-	if (plannedstmt->resultRelations)
-		resultRelation = linitial_int(plannedstmt->resultRelations);
-#endif
 	foreach(lc2, plannedstmt->rtable)
 	{
 		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc2);
@@ -670,16 +661,6 @@ pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire)
 			LockRelationOid(rte->relid, rte->rellockmode);
 		else
 			UnlockRelationOid(rte->relid, rte->rellockmode);
-
-#if PG_VERSION_NUM >= 140000
-		/* Lock partitions ahead of modifying them in parallel mode. */
-		if (rti == resultRelation &&
-			plannedstmt->partitionOids != NIL)
-			pgsp_AcquireExecutorLocksOnPartitions(plannedstmt->partitionOids,
-												  rte->rellockmode, acquire);
-
-		rti++;
-#endif
 	}
 }
 
