@@ -8,7 +8,6 @@ SELECT pg_shared_plans_reset();
 --
 SET plan_cache_mode TO auto;
 SET pg_shared_plans.enabled = off;
-SET pg_shared_plans.min_plan_time = '0ms';
 CREATE TABLE plancache AS SELECT 1 AS id, 'val' AS text;
 PREPARE plancache(int) AS SELECT * FROM plancache WHERE id = $1;
 
@@ -17,22 +16,30 @@ EXECUTE plancache(1);
 EXECUTE plancache(1);
 EXECUTE plancache(1);
 EXECUTE plancache(1);
--- should be a generic plan
-EXPLAIN (COSTS OFF) execute plancache(1);
+-- should be a (plancache) generic plan
+EXPLAIN (COSTS OFF) EXECUTE plancache(1);
 
 SET pg_shared_plans.enabled = on;
+SET pg_shared_plans.min_plan_time = '0ms';
 SET pg_shared_plans.threshold = 4;
 PREPARE plancache2(int) AS SELECT * FROM plancache WHERE id = $1;
 EXECUTE plancache2(1);
 EXECUTE plancache2(1);
 EXECUTE plancache2(1);
 EXECUTE plancache2(1);
+-- should bypass the planner
+EXECUTE plancache2(1);
+-- should bypass the planner and not create a plancache entry
 EXECUTE plancache2(1);
 SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
     generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
 FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%plancache%';
+
+SET pg_shared_plans.enabled = off;
+-- should now be a custom plan
+EXPLAIN (COSTS OFF) EXECUTE plancache2(1);
 
 -- Test all SRFs
 SELECT count(*) FROM pg_shared_plans(false, false);
@@ -92,8 +99,8 @@ FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%pg_class c%';
 
 -- should not be cached as planning time should be too fast
-execute fast(1);
-execute fast(1);
+EXECUTE fast(1);
+EXECUTE fast(1);
 
 SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
     plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,

@@ -61,6 +61,8 @@ PG_MODULE_MAGIC;
 #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every entry_dealloc */
 #define USAGE_DEALLOC_PERCENT	5		/* free this % of entries at once */
 
+#define PLANCACHE_THRESHOLD		5
+
 typedef struct pgspHashKey
 {
 	Oid			userid;		/* user OID is plans has RLS */
@@ -249,7 +251,7 @@ _PG_init(void)
 							&pgsp_threshold,
 							4,
 							1,
-							INT_MAX,
+							PLANCACHE_THRESHOLD,
 							PGC_SUSET,
 							0,
 							NULL,
@@ -448,19 +450,56 @@ pgsp_planner_hook(Query *parse,
 
 			if (use_cached)
 			{
+				Cost	total_diff;
+				Cost	diff;
+				int		nb_rels;
+
 				result = (PlannedStmt *) stringToNode(local);
 
 				LWLockRelease(pgsp->lock);
 				pgsp_acquire_executor_locks(result, true);
 
 				/*
-				 * Nullify plancache's heuristic to try to prefer local cachaed
-				 * plan so that it prefers to use own.
+				 * If our threshold is greater or equal than the plancache one,
+				 * we won't be able to bypass it, so just return our plan as
+				 * is.
+				 *
+				 * Note that this should not happen as our heuristics to choose
+				 * a generic plan is the same as plancache.  So if plancache
+				 * decided that a generic plan isn't suitable so should we.
 				 */
-				result->planTree->total_cost -= (1000.0 * cpu_operator_cost
-						* (list_length(result->rtable) + 1) + 10);
+				if (pgsp_threshold >= PLANCACHE_THRESHOLD)
+					return result;
+
+				/*
+				 * Nullify plancache heuristics to make it believe that a
+				 * custom plan (our shared cached one) should be preferred over
+				 * a generic one.  This will unfortunately only work if the
+				 * query is otherwise costly enough, as we don't want to return
+				 * a negative cost.
+				 */
+				nb_rels = list_length(result->rtable);
+
+				/* Compute the total additional cost plancache will add. */
+				total_diff = (1000.0 * cpu_operator_cost * (nb_rels + 1)) *
+							  PLANCACHE_THRESHOLD;
+
+				/*
+				 * Compute how much that represent for the number of times
+				 * we'll return our shared cached plan.
+				 */
+				diff = total_diff / (PLANCACHE_THRESHOLD - pgsp_threshold);
+
+				/* And add a safety margin, just in case. */
+				diff += 0.01;
+
+				/*
+				 * And finally remove that from the plan's total cost, making
+				 * sure that the total cost isn't negative.
+				 */
+				result->planTree->total_cost -= diff;
 				if (result->planTree->total_cost <= 0.0)
-					result->planTree->total_cost = 0.1;
+					result->planTree->total_cost = 0.001;
 
 				return result;
 			}

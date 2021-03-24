@@ -11,7 +11,6 @@ SELECT pg_shared_plans_reset();
 --
 SET plan_cache_mode TO auto;
 SET pg_shared_plans.enabled = off;
-SET pg_shared_plans.min_plan_time = '0ms';
 CREATE TABLE plancache AS SELECT 1 AS id, 'val' AS text;
 PREPARE plancache(int) AS SELECT * FROM plancache WHERE id = $1;
 EXECUTE plancache(1);
@@ -44,8 +43,8 @@ EXECUTE plancache(1);
   1 | val
 (1 row)
 
--- should be a generic plan
-EXPLAIN (COSTS OFF) execute plancache(1);
+-- should be a (plancache) generic plan
+EXPLAIN (COSTS OFF) EXECUTE plancache(1);
       QUERY PLAN       
 -----------------------
  Seq Scan on plancache
@@ -53,6 +52,7 @@ EXPLAIN (COSTS OFF) execute plancache(1);
 (2 rows)
 
 SET pg_shared_plans.enabled = on;
+SET pg_shared_plans.min_plan_time = '0ms';
 SET pg_shared_plans.threshold = 4;
 PREPARE plancache2(int) AS SELECT * FROM plancache WHERE id = $1;
 EXECUTE plancache2(1);
@@ -79,6 +79,14 @@ EXECUTE plancache2(1);
   1 | val
 (1 row)
 
+-- should bypass the planner
+EXECUTE plancache2(1);
+ id | text 
+----+------
+  1 | val
+(1 row)
+
+-- should bypass the planner and not create a plancache entry
 EXECUTE plancache2(1);
  id | text 
 ----+------
@@ -92,10 +100,19 @@ FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%plancache%';
  rolname | bypass | num_custom_plans | nb_rels | has_plantime | has_size | has_generic_cost |     plan_extract      
 ---------+--------+------------------+---------+--------------+----------+------------------+-----------------------
-         |      1 |                4 |       1 | t            | t        | t                | Seq Scan on plancache+
+         |      2 |                4 |       1 | t            | t        | t                | Seq Scan on plancache+
          |        |                  |         |              |          |                  |   Filter: (id = $1)  +
          |        |                  |         |              |          |                  | 
 (1 row)
+
+SET pg_shared_plans.enabled = off;
+-- should now be a custom plan
+EXPLAIN (COSTS OFF) EXECUTE plancache2(1);
+      QUERY PLAN       
+-----------------------
+ Seq Scan on plancache
+   Filter: (id = 1)
+(2 rows)
 
 -- Test all SRFs
 SELECT count(*) FROM pg_shared_plans(false, false);
@@ -201,13 +218,13 @@ WHERE query LIKE '%pg_class c%';
 (1 row)
 
 -- should not be cached as planning time should be too fast
-execute fast(1);
+EXECUTE fast(1);
  fast 
 ------
     2
 (1 row)
 
-execute fast(1);
+EXECUTE fast(1);
  fast 
 ------
     2
