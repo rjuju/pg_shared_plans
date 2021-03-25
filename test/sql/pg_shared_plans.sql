@@ -109,7 +109,7 @@ FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%+%';
 
 -- Test correct behavior when there are no source relation */
-set pg_shared_plans.min_plan_time = '0ms';
+SET pg_shared_plans.min_plan_time = '0ms';
 EXECUTE fast(1);
 EXECUTE fast(1);
 SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
@@ -129,7 +129,7 @@ CREATE TABLE s2.mytable AS SELECT 1 AS id, 'ns2' AS val;
 SET search_path TO s1;
 PREPARE ns (int) AS SELECT val FROM mytable WHERE id = $1;
 
-set pg_shared_plans.min_plan_time = '0ms';
+SET pg_shared_plans.min_plan_time = '0ms';
 -- Should add the query in shared cache
 EXECUTE ns(1);
 -- Should bypass the planner
@@ -155,7 +155,7 @@ WHERE query LIKE '%mytable%';
 --
 -- Const detection
 --
-set pg_shared_plans.min_plan_time = '0ms';
+SET pg_shared_plans.min_plan_time = '0ms';
 SET search_path TO public;
 CREATE TABLE small AS SELECT 1 AS id FROM generate_series(1, 10);
 
@@ -198,7 +198,7 @@ WHERE query LIKE '%another%';
 --
 -- RLS
 --
-set pg_shared_plans.min_plan_time = '0ms';
+SET pg_shared_plans.min_plan_time = '0ms';
 SET search_path TO public;
 CREATE USER regress_a;
 CREATE USER regress_b;
@@ -246,6 +246,23 @@ SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
 FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%mytemp%'
 ORDER BY rolname COLLATE "C" ASC;
+
+-- Dropped index
+CREATE TABLE t_ind AS SELECT id FROM generate_series(1, 10000) id;
+CREATE INDEX t_ind_idx ON t_ind (id);
+VACUUM ANALYZE t_ind;
+
+PREPARE t_ind (int) AS SELECT id FROM t_ind WHERE id = $1;
+
+EXECUTE t_ind(1);
+EXECUTE t_ind(1);
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
+
+DROP INDEX t_ind_idx;
+-- FIXME cached plan should be evicted
+EXECUTE t_ind(1);
+-- FIXME: decide what should be done with existing entry and its counters
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
 
 DROP TABLE mysecretdata CASCADE;
 DROP ROLE regress_a;
