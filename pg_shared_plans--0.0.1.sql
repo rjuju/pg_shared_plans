@@ -31,7 +31,9 @@ LANGUAGE C STRICT PARALLEL SAFE;
 -- Don't want this to be available to non-superusers.
 REVOKE ALL ON FUNCTION pg_shared_plans_reset(Oid, Oid, bigint) FROM PUBLIC;
 
-CREATE FUNCTION pg_shared_plans(IN showplan boolean, IN showrels boolean,
+CREATE FUNCTION pg_shared_plans(IN showplan boolean DEFAULT false,
+    IN showrels boolean DEFAULT false,
+    IN  dbid oid DEFAULT 0, in relid oid DEFAULT 0,
     OUT userid oid,
     OUT dbid oid,
     OUT queryid bigint,

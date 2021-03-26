@@ -524,9 +524,7 @@ ORDER BY rolname COLLATE "C" ASC;
 CREATE TABLE t_ind AS SELECT id FROM generate_series(1, 10000) id;
 CREATE INDEX t_ind_idx ON t_ind (id);
 VACUUM ANALYZE t_ind;
-
 PREPARE t_ind (int) AS SELECT id FROM t_ind WHERE id = $1;
-
 EXECUTE t_ind(1);
  id 
 ----
@@ -560,7 +558,26 @@ SELECT bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
       ?
 (1 row)
 
+-- test rdepend filtering
+SELECT rolname
+FROM pg_shared_plans(false, false, 0, 'mysecretdata'::regclass) pgsp
+LEFT JOIN pg_roles r ON r.oid = pgsp.userid
+ORDER BY rolname COLLATE "C" ASC;
+  rolname  
+-----------
+ regress_a
+ regress_b
+ regress_c
+(3 rows)
+
 DROP TABLE mysecretdata CASCADE;
+-- test partial reset, and rdepend unregister
+SELECT pg_shared_plans_reset('regress_a'::regrole);
+ pg_shared_plans_reset 
+-----------------------
+ 
+(1 row)
+
 DROP ROLE regress_a;
 DROP ROLE regress_b;
 DROP ROLE regress_c;

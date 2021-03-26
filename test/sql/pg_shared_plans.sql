@@ -264,7 +264,15 @@ EXECUTE t_ind(1);
 -- FIXME: decide what should be done with existing entry and its counters
 SELECT bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
 
+-- test rdepend filtering
+SELECT rolname
+FROM pg_shared_plans(false, false, 0, 'mysecretdata'::regclass) pgsp
+LEFT JOIN pg_roles r ON r.oid = pgsp.userid
+ORDER BY rolname COLLATE "C" ASC;
+
 DROP TABLE mysecretdata CASCADE;
+-- test partial reset, and rdepend unregister
+SELECT pg_shared_plans_reset('regress_a'::regrole);
 DROP ROLE regress_a;
 DROP ROLE regress_b;
 DROP ROLE regress_c;
