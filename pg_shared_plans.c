@@ -53,9 +53,6 @@
 PG_MODULE_MAGIC;
 
 #define PGSP_TRANCHE_NAME		"pg_shared_plans"
-#define PGSP_MAGIC				0x20210318
-#define PGSP_PLAN_KEY			UINT64CONST(1)
-#define PGSP_REL_KEY			UINT64CONST(2)
 #define PGSP_USAGE_INIT			(1.0)
 #define ASSUMED_MEDIAN_INIT		(10.0)	/* initial assumed median usage */
 #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every entry_dealloc */
