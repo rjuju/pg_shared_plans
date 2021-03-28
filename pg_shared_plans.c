@@ -14,11 +14,14 @@
 #include "postgres.h"
 
 #include "access/relation.h"
+#include "catalog/index.h"
+#include "catalog/namespace.h"
 #if PG_VERSION_NUM < 130000
 #include "catalog/pg_type_d.h"
 #endif
 #include "commands/dbcommands.h"
 #include "commands/explain.h"
+#include "commands/tablecmds.h"
 #if PG_VERSION_NUM >= 130000
 #include "common/hashfn.h"
 #else
@@ -83,6 +86,7 @@ typedef struct pgspEntry
 	int			num_const;	/* # of const values in the plan */
 	double		plantime;	/* first generic planning time */
 	Cost		generic_cost; /* total cost of the stored plan */
+	int64		discard;	/* # of time plan was discarded */
 	slock_t		mutex;		/* protects following fields only */
 	int64		bypass;		/* number of times magic happened */
 	double		usage;		/* usage factor */
@@ -154,6 +158,7 @@ typedef struct pgspSharedState
 /* Saved hook values in case of unload */
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 
 /* Links to shared memory state */
 static pgspSharedState *pgsp = NULL;
@@ -197,6 +202,17 @@ static PlannedStmt *pgsp_planner_hook(Query *parse,
 #endif
 									  int cursorOptions,
 									  ParamListInfo boundParams);
+static void pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+								ProcessUtilityContext context,
+								ParamListInfo params,
+								QueryEnvironment *queryEnv,
+								DestReceiver *dest,
+#if PG_VERSION_NUM >= 130000
+								QueryCompletion *qc
+#else
+								char *completionTag
+#endif
+								);
 
 static void pgsp_attach_dsa(void);
 static void pg_shared_plans_shutdown(Datum arg);
@@ -209,6 +225,7 @@ static void pgsp_accum_custom_plan(pgspHashKey *key, Cost cost);
 static void pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire);
 static bool pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
 							   pgspHashKey *key);
+static void pgsp_deallocate_plan_by_relid(Oid relid);
 static bool pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats);
 static const char *pgsp_get_plan(dsa_pointer plan);
 static void pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic,
@@ -363,6 +380,8 @@ _PG_init(void)
 	shmem_startup_hook = pgsp_shmem_startup;
 	prev_planner_hook = planner_hook;
 	planner_hook = pgsp_planner_hook;
+	prev_ProcessUtility = ProcessUtility_hook;
+	ProcessUtility_hook = pgsp_ProcessUtility;
 }
 
 void
@@ -371,6 +390,7 @@ _PG_fini(void)
 	/* uninstall hooks */
 	shmem_startup_hook = prev_shmem_startup_hook;
 	planner_hook = prev_planner_hook;
+	ProcessUtility_hook = prev_ProcessUtility;
 
 }
 
@@ -563,8 +583,11 @@ pgsp_planner_hook(Query *parse,
 		}
 		else
 		{
-			/* Should not happen. */
-			Assert(false);
+			/*
+			 * Plan was discarded, clear entry pointer.  Later code will
+			 * detect the missing plan and save a fresh new one.
+			 */
+			entry = NULL;
 		}
 	}
 
@@ -631,6 +654,189 @@ fallback:
 								query_string,
 #endif
 								cursorOptions, boundParams);
+}
+
+/*
+ * Inspect the UTILITY command being run and discard cached plan as needed.
+ *
+ * There is no guarantee that the transaction will eventually commit, so we may
+ * discard a plan for nothing, but this should hopfully not be a common case.
+ * Also the current backend can't cache new plans until its transaction is
+ * finished, as it could otherwise leave invalid or inefficient plans if its
+ * transaction is rollbacked.
+ * Other backend won't be able to process any query against the impacted
+ * relations until the transaction is finished as they will be blocked by the
+ * AccessExclusiveLock acquired by this UTILITY, so there's no risk to create
+ * invalid / inefficient plans from other backends.
+ *
+ * FIXME: this is far from being finished.  Minimal list of things that still
+ * needs to be handled:
+ *
+ * - find all the impacted relations in case of CASCADEd utility
+ * - this approach is only safe if the UTILITY requires an AccessExclusiveLock.
+ *   Therefore any of the CONCURRENTLY version of UTILITY will void current
+ *   assumption.  Find a way to deal with it :)
+ * - if this UTILITY is dropping one of the rtable entry, we should evict
+ *   entirely the entry from the main hash table rather than discarding the
+ *   plan.
+ * - we should also discard plans when new indexes are added
+ * - lot of work needed for partitioning
+ * - only RELATIONs are handled.  What about functions, operators...
+ * - client should not be able to override pg_shared_plans.read_only if we set
+ *   it here.
+ */
+static void
+pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+					ProcessUtilityContext context,
+					ParamListInfo params,
+					QueryEnvironment *queryEnv,
+					DestReceiver *dest,
+#if PG_VERSION_NUM >= 130000
+					QueryCompletion *qc
+#else
+					char *completionTag
+#endif
+					)
+{
+	Node   *parsetree = pstmt->utilityStmt;
+	List   *oids = NIL;
+
+	/* Create or attach to the dsa. */
+	pgsp_attach_dsa();
+
+	if (IsA(parsetree, DropStmt))
+	{
+		DropStmt *drop = (DropStmt *) parsetree;
+		List     *objs = NIL;
+		ListCell *cell;
+
+		switch (drop->removeType)
+		{
+			/* For indexes we need to get the underlying table instead. */
+			case OBJECT_INDEX:
+			{
+				foreach(cell, drop->objects)
+				{
+					List *name = (List *) lfirst(cell);
+					RangeVar *rel = makeRangeVarFromNameList(name);
+					Oid			indoid, heapoid;
+
+					/*
+					 * FIXME: see how to handle DROP CONCURRENTLY
+					 * XXX: is it really ok to ignore permissions here, as
+					 * standard_ProcessUtility will fail before we actually use
+					 * the generated list?
+					 */
+					indoid = RangeVarGetRelidExtended(rel, AccessExclusiveLock,
+							RVR_MISSING_OK, NULL, NULL);
+					if (!OidIsValid(indoid))
+						break; /* XXX can that happen? */
+
+					heapoid = IndexGetRelation(indoid, true);
+					if (!OidIsValid(heapoid))
+						break; /* XXX can that happen? */
+
+					/* Got the root table, directly add its oid */
+					oids = list_append_unique_oid(oids, heapoid);
+				}
+				break;
+			}
+			case OBJECT_FOREIGN_TABLE:
+			case OBJECT_MATVIEW:
+			case OBJECT_TABLE:
+			case OBJECT_VIEW:
+				/* Handled types. */
+				objs = drop->objects;
+				break;
+			default:
+				/* nothing to do. */
+				break;
+		}
+
+		foreach(cell, objs)
+		{
+			RangeVar   *rel = makeRangeVarFromNameList((List *) lfirst(cell));
+			Oid         oid;
+
+			oid = RangeVarGetRelidExtended(rel, AccessShareLock,
+					RVR_MISSING_OK, NULL, NULL);
+
+			if (OidIsValid(oid))
+				oids = list_append_unique_oid(oids, oid);
+		}
+	}
+
+	if (prev_ProcessUtility)
+		prev_ProcessUtility(pstmt, queryString,
+				context, params, queryEnv,
+				dest,
+#if PG_VERSION_NUM >= 130000
+				qc
+#else
+				completionTag
+#endif
+				);
+	else
+		standard_ProcessUtility(pstmt, queryString,
+				context, params, queryEnv,
+				dest,
+#if PG_VERSION_NUM >= 130000
+				qc
+#else
+				completionTag
+#endif
+				);
+
+	if (IsA(parsetree, AlterTableStmt))
+	{
+		AlterTableStmt *atstmt = (AlterTableStmt *) parsetree;
+		LOCKMODE    lockmode;
+
+		/*
+		 * Any change that doesn't require an AccessExclusiveLock shouldn't
+		 * impact the plan.
+		 */
+		lockmode = AlterTableGetLockLevel(atstmt->cmds);
+		if (lockmode >= AccessExclusiveLock)
+		{
+			Oid         oid = AlterTableLookupRelation(atstmt, lockmode);
+
+			if (OidIsValid(oid))
+				oids = lappend_oid(oids, oid);
+		}
+	}
+
+	/*
+	 * Now that the command completed, drop any saved plan referencing the
+	 * underlying relation.
+	 * Note that if this is an AlterTableStmt, it's actually only required if
+	 * the changed column is only used in the plan's target list, as otherwise
+	 * a new queryid will be generated. But unless the transaction won't commit
+	 * the currently stored plan won't be used ever again so let's just clean
+	 * it now.
+	 */
+	if (oids != NIL)
+	{
+		ListCell *lc;
+
+		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+
+		foreach(lc, oids)
+		{
+			Oid oid = lfirst_oid(lc);
+
+			pgsp_deallocate_plan_by_relid(oid);
+		}
+
+		/*
+		 * Also make sure that we don't cache a new plan as we don't know if
+		 * the transaction will commit or not.
+		 */
+		set_config_option("pg_shared_plans.read_only", "on", PGC_USERSET,
+				PGC_S_SESSION, GUC_ACTION_LOCAL, true, 0, false);
+
+		LWLockRelease(pgsp->lock);
+	}
 }
 
 /*
@@ -913,6 +1119,45 @@ pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
 	return ok;
 }
 
+static void
+pgsp_deallocate_plan_by_relid(Oid relid)
+{
+	pgspRdependKey		rkey = {MyDatabaseId, relid};
+	pgspRdependEntry   *rentry;
+	pgspHashKey		   *rkeys;
+	int					i;
+
+	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
+	Assert(area != NULL);
+
+	rentry = dshash_find(pgsp_rdepend, &rkey, true);
+
+	if(!rentry)
+		return;
+
+	Assert(rentry->keys != InvalidDsaPointer);
+
+	rkeys = (pgspHashKey *) dsa_get_address(area, rentry->keys);
+	Assert(rkeys != NULL);
+
+	for(i = 0; i < rentry->num_keys; i++)
+	{
+		pgspEntry *entry;
+
+		entry = hash_search(pgsp_hash, &rkeys[i], HASH_FIND, NULL);
+		if (!entry)
+			continue;
+
+		if (entry->plan == InvalidDsaPointer)
+			continue;
+
+		dsa_free(area, entry->plan);
+		entry->plan = InvalidDsaPointer;
+	}
+
+	dshash_release_lock(pgsp_rdepend, rentry);
+}
+
 /*
  * Decide whether to use a cached plan or not, and if caller should accumulate
  * custom plan statistics.
@@ -968,8 +1213,10 @@ static const char *
 pgsp_get_plan(dsa_pointer plan)
 {
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
-	Assert(plan != InvalidDsaPointer);
 	Assert(area != NULL);
+
+	if (plan == InvalidDsaPointer)
+		return NULL;
 
 	return (const char *) dsa_get_address(area, plan);
 }
@@ -1090,6 +1337,7 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 		entry->num_const = num_const;
 		entry->plantime = plantime;
 		entry->generic_cost = generic_cost;
+		entry->discard = 0;
 
 		/* re-initialize the mutex each time ... we assume no one using it */
 		SpinLockInit(&entry->mutex);
@@ -1097,6 +1345,12 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 		entry->usage = PGSP_USAGE_INIT;
 		entry->total_custom_cost = custom_cost;
 		entry->num_custom_plans = 1.0;
+	}
+	else if (entry->plan == InvalidDsaPointer)
+	{
+		/* Plan was discarded, simply register the new one. */
+		entry->plan = context->plan;
+		entry->discard += 1;
 	}
 
 	/* We should always have a valid handle */
@@ -1335,8 +1589,8 @@ pgsp_entry_remove(pgspEntry *entry)
 	Assert(area != NULL);
 
 	/* Free the dsa allocated memory. */
-	Assert(entry->plan != InvalidDsaPointer);
-	dsa_free(area, entry->plan);
+	if (entry->plan != InvalidDsaPointer)
+		dsa_free(area, entry->plan);
 
 	if (entry->rels != InvalidDsaPointer)
 	{
@@ -1771,6 +2025,7 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		double		total_custom_cost;
 		int64		num_custom_plans;
 		double		generic_cost;
+		int64		discard;
 
 		Assert(fctx->call_cntr < fctx->max_calls);
 		Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
@@ -1779,6 +2034,7 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		len = entry->len;
 		plantime = entry->plantime;
 		generic_cost = entry->generic_cost;
+		discard = entry->discard;
 
 		SpinLockAcquire(&e->mutex);
 		bypass = entry->bypass;
@@ -1807,6 +2063,7 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		values[i++] = Int64GetDatumFast(num_custom_plans);
 		values[i++] = Float8GetDatumFast(generic_cost);
 		values[i++] = Int32GetDatum(entry->num_rels);
+		values[i++] = Int64GetDatumFast(discard);
 
 		if (showrels)
 		{
@@ -1825,7 +2082,7 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 			if (local)
 				values[i++] = CStringGetTextDatum(local);
 			else
-				values[i++] = CStringGetTextDatum("<no toc>");
+				values[i++] = CStringGetTextDatum("<discarded>");
 		}
 		else
 			nulls[i++] = true;

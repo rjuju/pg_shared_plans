@@ -256,13 +256,13 @@ PREPARE t_ind (int) AS SELECT id FROM t_ind WHERE id = $1;
 
 EXECUTE t_ind(1);
 EXECUTE t_ind(1);
-SELECT bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
+SELECT discard, bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
 
 DROP INDEX t_ind_idx;
--- FIXME cached plan should be evicted
+-- cached plan should be discarded, entry preserved
 EXECUTE t_ind(1);
--- FIXME: decide what should be done with existing entry and its counters
-SELECT bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
+-- plan should have been discarded once, and kept its previous counters
+SELECT discard, bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
 
 -- test rdepend filtering
 SELECT rolname

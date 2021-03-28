@@ -46,6 +46,7 @@ CREATE FUNCTION pg_shared_plans(IN showplan boolean DEFAULT false,
     OUT num_custom_plans bigint,
     OUT generic_cost float8,
     OUT num_relations integer,
+    OUT discard bigint,
     OUT relations oid[],
     OUT plan text)
 RETURNS SETOF record
@@ -66,6 +67,7 @@ CREATE VIEW pg_shared_plans AS
     pgsp.num_custom_plans,
     pgsp.generic_cost,
     pgsp.num_relations,
+    pgsp.discard,
     pgss.query
   FROM pg_shared_plans(false, false) AS pgsp
   LEFT JOIN pg_stat_statements AS pgss USING (dbid, queryid)
@@ -84,6 +86,7 @@ CREATE VIEW pg_shared_plans_relations AS
     pgsp.num_custom_plans,
     pgsp.generic_cost,
     pgsp.num_relations,
+    pgsp.discard,
     pgss.query,
     pgsp.relations
   FROM pg_shared_plans(true, false) AS pgsp
@@ -105,6 +108,7 @@ CREATE VIEW pg_shared_plans_explain AS
     pgsp.num_custom_plans,
     pgsp.generic_cost,
     pgsp.num_relations,
+    pgsp.discard,
     pgss.query,
     pgsp.plan
   FROM pg_shared_plans(false, true) AS pgsp
@@ -126,6 +130,7 @@ CREATE VIEW pg_shared_plans_all AS
     pgsp.num_custom_plans,
     pgsp.generic_cost,
     pgsp.num_relations,
+    pgsp.discard,
     pgss.query,
     pgsp.relations,
     pgsp.plan

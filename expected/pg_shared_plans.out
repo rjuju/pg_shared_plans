@@ -537,25 +537,25 @@ EXECUTE t_ind(1);
   1
 (1 row)
 
-SELECT bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
- bypass 
---------
-      1
+SELECT discard, bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
+ discard | bypass 
+---------+--------
+       0 |      1
 (1 row)
 
 DROP INDEX t_ind_idx;
--- FIXME cached plan should be evicted
+-- cached plan should be discarded, entry preserved
 EXECUTE t_ind(1);
  id 
 ----
   1
 (1 row)
 
--- FIXME: decide what should be done with existing entry and its counters
-SELECT bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
- bypass 
---------
-      ?
+-- plan should have been discarded once, and kept its previous counters
+SELECT discard, bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
+ discard | bypass 
+---------+--------
+       1 |      1
 (1 row)
 
 -- test rdepend filtering
