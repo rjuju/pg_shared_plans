@@ -168,6 +168,9 @@ static dshash_table *pgsp_rdepend = NULL;
 
 /*---- GUC variables ----*/
 
+#ifdef USE_ASSERT_CHECKING
+static bool pgsp_cache_all;
+#endif
 static bool pgsp_enabled;
 static int	pgsp_max;
 static int	pgsp_min_plantime;
@@ -269,6 +272,19 @@ _PG_init(void)
 	/*
 	 * Define (or redefine) custom GUC variables.
 	 */
+#ifdef USE_ASSERT_CHECKING
+	DefineCustomBoolVariable("pg_shared_plans.cache_regular_statements",
+							 "Enable or disable caching of regular statements.",
+							 NULL,
+							 &pgsp_cache_all,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+#endif
+
 	DefineCustomBoolVariable("pg_shared_plans.enabled",
 							 "Enable or disable pg_shared_plans.",
 							 NULL,
@@ -482,7 +498,13 @@ pgsp_planner_hook(Query *parse,
 	bool			accum_custom_stats = false;
 	pgspWalkerContext context;
 
-	if (!pgsp_enabled || parse->queryId == UINT64CONST(0) || boundParams == NULL)
+	if (!pgsp_enabled || parse->queryId == UINT64CONST(0) ||
+#ifdef USE_ASSERT_CHECKING
+			(!pgsp_cache_all && boundParams == NULL)
+#else
+			boundParams == NULL
+#endif
+			)
 		goto fallback;
 
 	if (parse->utilityStmt != NULL)
@@ -508,6 +530,31 @@ pgsp_planner_hook(Query *parse,
 	 */
 	if (pgsp_query_walker((Node *) parse, &context))
 		goto fallback;
+
+#ifdef USE_ASSERT_CHECKING
+	/*
+	 * If we cache regular statements, we can't rely anymore on plancache
+	 * checks preventing cached plans to be reused when the tuple descriptor
+	 * has changed.
+	 */
+	if (pgsp_cache_all)
+	{
+		TupleDesc	desc;
+		int			i;
+
+		desc = ExecCleanTypeFromTL(parse->targetList);
+		context.constid = hash_combine(context.constid, hashTupleDesc(desc));
+
+		/* We also need to take into account resname. */
+		for (i = 0; i < desc->natts; i++)
+		{
+			char *attname = TupleDescAttr(desc, i)->attname.data;
+
+			context.constid = hash_combine(context.constid,
+					hash_any((const unsigned char *)attname, strlen(attname)));
+		}
+	}
+#endif
 
 	key.constid = context.constid;
 
