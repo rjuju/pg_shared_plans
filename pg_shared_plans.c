@@ -1799,7 +1799,7 @@ pg_shared_plans_reset(PG_FUNCTION_ARGS)
 
 	userid = PG_GETARG_OID(0);
 	dbid = PG_GETARG_OID(1);
-	queryid = (uint64) PG_GETARG_INT64(1);
+	queryid = (uint64) PG_GETARG_INT64(2);
 
 	if (!pgsp || !pgsp_hash)
 		ereport(ERROR,
@@ -1830,7 +1830,7 @@ pg_shared_plans_reset(PG_FUNCTION_ARGS)
 	//	}
 	//}
 	//else
-	if (dbid != 0 || dbid != 0 || queryid != UINT64CONST(0))
+	if (userid != 0 || dbid != 0 || queryid != UINT64CONST(0))
 	{
 		/* Remove entries corresponding to valid parameters. */
 		hash_seq_init(&hash_seq, pgsp_hash);
