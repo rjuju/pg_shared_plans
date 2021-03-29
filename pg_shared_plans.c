@@ -228,7 +228,7 @@ static void pgsp_accum_custom_plan(pgspHashKey *key, Cost cost);
 static void pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire);
 static bool pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
 							   pgspHashKey *key);
-static void pgsp_deallocate_plan_by_relid(Oid relid);
+static void pgsp_evict_by_relid(Oid dbid, Oid relid, bool dropEntry);
 static bool pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats);
 static const char *pgsp_get_plan(dsa_pointer plan);
 static void pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic,
@@ -746,7 +746,8 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 					)
 {
 	Node   *parsetree = pstmt->utilityStmt;
-	List   *oids = NIL;
+	List   *oids_discard = NIL,
+		   *oids_remove = NIL;
 
 	/* Create or attach to the dsa. */
 	pgsp_attach_dsa();
@@ -754,7 +755,7 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	if (IsA(parsetree, DropStmt))
 	{
 		DropStmt *drop = (DropStmt *) parsetree;
-		List     *objs = NIL;
+		List     *objs_remove = NIL;
 		ListCell *cell;
 
 		switch (drop->removeType)
@@ -783,8 +784,13 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 					if (!OidIsValid(heapoid))
 						break; /* XXX can that happen? */
 
-					/* Got the root table, directly add its oid */
-					oids = list_append_unique_oid(oids, heapoid);
+					/*
+					 * Got the root table, directly add its oid to the discard
+					 * list.  We assume that a generic plan will still be a
+					 * good idea after the index is removed.
+					 */
+					oids_discard = list_append_unique_oid(oids_discard,
+														  heapoid);
 				}
 				break;
 			}
@@ -793,14 +799,14 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 			case OBJECT_TABLE:
 			case OBJECT_VIEW:
 				/* Handled types. */
-				objs = drop->objects;
+				objs_remove = drop->objects;
 				break;
 			default:
 				/* nothing to do. */
 				break;
 		}
 
-		foreach(cell, objs)
+		foreach(cell, objs_remove)
 		{
 			RangeVar   *rel = makeRangeVarFromNameList((List *) lfirst(cell));
 			Oid         oid;
@@ -809,7 +815,7 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 					RVR_MISSING_OK, NULL, NULL);
 
 			if (OidIsValid(oid))
-				oids = list_append_unique_oid(oids, oid);
+				oids_remove = list_append_unique_oid(oids_remove, oid);
 		}
 	}
 
@@ -841,7 +847,9 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 
 		/*
 		 * Any change that doesn't require an AccessExclusiveLock shouldn't
-		 * impact the plan.
+		 * impact the plan.  We assume that it's better to discard the plans
+		 * only, hoping that there will be more entries which will still be
+		 * valid after the ALTER TABLE.
 		 */
 		lockmode = AlterTableGetLockLevel(atstmt->cmds);
 		if (lockmode >= AccessExclusiveLock)
@@ -849,30 +857,37 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 			Oid         oid = AlterTableLookupRelation(atstmt, lockmode);
 
 			if (OidIsValid(oid))
-				oids = lappend_oid(oids, oid);
+				oids_discard = lappend_oid(oids_discard, oid);
 		}
 	}
 
 	/*
-	 * Now that the command completed, drop any saved plan referencing the
-	 * underlying relation.
+	 * Now that the command completed, discard any saved plan or drop the entry
+	 * referencing the underlying relation, depending on the original UTILITY.
 	 * Note that if this is an AlterTableStmt, it's actually only required if
 	 * the changed column is only used in the plan's target list, as otherwise
 	 * a new queryid will be generated. But unless the transaction won't commit
 	 * the currently stored plan won't be used ever again so let's just clean
 	 * it now.
 	 */
-	if (oids != NIL)
+	if (oids_discard != NIL || oids_remove != NIL)
 	{
 		ListCell *lc;
 
 		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
 
-		foreach(lc, oids)
+		foreach(lc, oids_discard)
 		{
 			Oid oid = lfirst_oid(lc);
 
-			pgsp_deallocate_plan_by_relid(oid);
+			pgsp_evict_by_relid(MyDatabaseId, oid, false);
+		}
+
+		foreach(lc, oids_remove)
+		{
+			Oid oid = lfirst_oid(lc);
+
+			pgsp_evict_by_relid(MyDatabaseId, oid, true);
 		}
 
 		/*
@@ -1166,10 +1181,14 @@ pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
 	return ok;
 }
 
+/*
+ * Handle cache eviction.  If dropEntry is false, only discard the plan,
+ * otherwise also remove the pgspEntry from pgsp_hash.
+ */
 static void
-pgsp_deallocate_plan_by_relid(Oid relid)
+pgsp_evict_by_relid(Oid dbid, Oid relid, bool dropEntry)
 {
-	pgspRdependKey		rkey = {MyDatabaseId, relid};
+	pgspRdependKey		rkey = {dbid, relid};
 	pgspRdependEntry   *rentry;
 	pgspHashKey		   *rkeys;
 	int					i;
@@ -1200,6 +1219,9 @@ pgsp_deallocate_plan_by_relid(Oid relid)
 
 		dsa_free(area, entry->plan);
 		entry->plan = InvalidDsaPointer;
+
+		if(dropEntry)
+			hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
 	}
 
 	dshash_release_lock(pgsp_rdepend, rentry);
