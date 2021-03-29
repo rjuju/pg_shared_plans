@@ -14,6 +14,7 @@
 #include "postgres.h"
 
 #include "access/relation.h"
+#include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #if PG_VERSION_NUM < 130000
@@ -50,6 +51,7 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #if PG_VERSION_NUM < 140000
 #include "utils/timestamp.h"
 #endif
@@ -67,6 +69,15 @@ PG_MODULE_MAGIC;
 #define PGSP_RDEPEND_MAX		160		/* max rdepend entry array size */
 
 #define PLANCACHE_THRESHOLD		5
+
+typedef enum pgspEvictionKind
+{
+	PGSP_UNLOCK,
+	PGSP_DISCARD,
+	PGSP_DISCARD_AND_LOCK,
+	PGSP_EVICT
+} pgspEvictionKind;
+
 
 typedef struct pgspHashKey
 {
@@ -87,6 +98,7 @@ typedef struct pgspEntry
 	double		plantime;	/* first generic planning time */
 	Cost		generic_cost; /* total cost of the stored plan */
 	int64		discard;	/* # of time plan was discarded */
+	pg_atomic_uint32 lockers;/* prevent new plans from being saved if > 0 */
 	slock_t		mutex;		/* protects following fields only */
 	int64		bypass;		/* number of times magic happened */
 	double		usage;		/* usage factor */
@@ -228,7 +240,7 @@ static void pgsp_accum_custom_plan(pgspHashKey *key, Cost cost);
 static void pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire);
 static bool pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
 							   pgspHashKey *key);
-static void pgsp_evict_by_relid(Oid dbid, Oid relid, bool dropEntry);
+static void pgsp_evict_by_relid(Oid dbid, Oid relid, pgspEvictionKind kind);
 static bool pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats);
 static const char *pgsp_get_plan(dsa_pointer plan);
 static void pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic,
@@ -747,7 +759,8 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 {
 	Node   *parsetree = pstmt->utilityStmt;
 	List   *oids_discard = NIL,
-		   *oids_remove = NIL;
+		   *oids_remove = NIL,
+		   *oids_lock = NIL;
 
 	/* Create or attach to the dsa. */
 	pgsp_attach_dsa();
@@ -763,6 +776,16 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 			/* For indexes we need to get the underlying table instead. */
 			case OBJECT_INDEX:
 			{
+				/*
+				 * Don't mess  up with the transactions if the command is gonna
+				 * fail.
+				 */
+				if (drop->concurrent &&
+					(GetTopTransactionIdIfAny() != InvalidTransactionId ||
+					 IsTransactionBlock())
+				)
+					goto run_utility;
+
 				foreach(cell, drop->objects)
 				{
 					List *name = (List *) lfirst(cell);
@@ -789,8 +812,27 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 					 * list.  We assume that a generic plan will still be a
 					 * good idea after the index is removed.
 					 */
-					oids_discard = list_append_unique_oid(oids_discard,
-														  heapoid);
+					if (drop->concurrent)
+						oids_lock = list_append_unique_oid(oids_lock, heapoid);
+					else
+						oids_discard = list_append_unique_oid(oids_discard,
+															  heapoid);
+
+					/*
+					 * CIC expects to be the first command in a transaction, so
+					 * commit the transaction that we just started when looking
+					 * for the root table name and start a fresh one.
+					 */
+					if (drop->concurrent)
+					{
+						MemoryContext	oldcontext = CurrentMemoryContext;
+
+						PopActiveSnapshot();
+						CommitTransactionCommand();
+						StartTransactionCommand();
+						MemoryContextSwitchTo(oldcontext);
+						PushActiveSnapshot(GetTransactionSnapshot());
+					}
 				}
 				break;
 			}
@@ -818,6 +860,44 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				oids_remove = list_append_unique_oid(oids_remove, oid);
 		}
 	}
+
+	/* For CIC, the index will be unusable in the middle of index_drop, with
+	 * no AEL kept long enough to protect our cache.  So the best we can do
+	 * since we can't hook on the catalog invalidation infrastructure is to
+	 *  - discard the cache now
+	 *  - lock the dpendent entries to prevent any new plan to be saved
+	 *  - downgrade the lock on pgsp->lock while the entries are lock
+	 *  - hold that shared lock until after standard_ProcessUtility execution
+	 *    and hope this backend won't be killed while the entries are locked,
+	 *    otherwise they would be locked until they get evicted.
+	 */
+	if (oids_lock)
+	{
+		ListCell *lc;
+
+		Assert(oids_discard == NIL && oids_remove == NULL);
+
+		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+
+		foreach(lc, oids_lock)
+			pgsp_evict_by_relid(MyDatabaseId, lfirst_oid(lc),
+								PGSP_DISCARD_AND_LOCK);
+
+		/*
+		 * Downgrade the lock.  We locked all the underlying entries so there's
+		 * no risk of having another backend caching a new plan before the
+		 * index is really dropped.  There's however a risk that the entry
+		 * gets evicted and recreated before acquiring the shared lock on
+		 * pgsp->lock, leaving the new entry indefinitely locked.
+		 */
+		LWLockRelease(pgsp->lock);
+		LWLockAcquire(pgsp->lock, LW_SHARED);
+
+		foreach(lc, oids_lock)
+			pgsp_evict_by_relid(MyDatabaseId, lfirst_oid(lc), PGSP_UNLOCK);
+	}
+
+run_utility:
 
 	if (prev_ProcessUtility)
 		prev_ProcessUtility(pstmt, queryString,
@@ -873,33 +953,28 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	}
 
 	/*
-	 * Now that the command completed, discard any saved plan or drop the entry
-	 * referencing the underlying relation, depending on the original UTILITY.
-	 * Note that if this is an AlterTableStmt, it's actually only required if
-	 * the changed column is only used in the plan's target list, as otherwise
-	 * a new queryid will be generated. But unless the transaction won't commit
-	 * the currently stored plan won't be used ever again so let's just clean
-	 * it now.
+	 * Now that the command completed, discard any saved plan, or drop the
+	 * entry referencing the underlying relation, or unlock the required
+	 * entries depending on the original UTILITY.
 	 */
-	if (oids_discard != NIL || oids_remove != NIL)
+	if (oids_discard != NIL || oids_remove != NIL || oids_lock != NIL)
 	{
 		ListCell *lc;
 
-		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+		if (oids_lock != NIL)
+		{
+			Assert(oids_discard == NULL && oids_remove == NULL);
+		}
+		else
+		{
+			LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+		}
 
 		foreach(lc, oids_discard)
-		{
-			Oid oid = lfirst_oid(lc);
-
-			pgsp_evict_by_relid(MyDatabaseId, oid, false);
-		}
+			pgsp_evict_by_relid(MyDatabaseId, lfirst_oid(lc), PGSP_DISCARD);
 
 		foreach(lc, oids_remove)
-		{
-			Oid oid = lfirst_oid(lc);
-
-			pgsp_evict_by_relid(MyDatabaseId, oid, true);
-		}
+			pgsp_evict_by_relid(MyDatabaseId, lfirst_oid(lc), PGSP_EVICT);
 
 		/*
 		 * Also make sure that we don't cache a new plan as we don't know if
@@ -1197,14 +1272,18 @@ pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
  * otherwise also remove the pgspEntry from pgsp_hash.
  */
 static void
-pgsp_evict_by_relid(Oid dbid, Oid relid, bool dropEntry)
+pgsp_evict_by_relid(Oid dbid, Oid relid, pgspEvictionKind kind)
 {
 	pgspRdependKey		rkey = {dbid, relid};
 	pgspRdependEntry   *rentry;
 	pgspHashKey		   *rkeys;
 	int					i;
 
-	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
+	if (kind == PGSP_UNLOCK)
+		Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
+	else
+		Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
+
 	Assert(area != NULL);
 
 	rentry = dshash_find(pgsp_rdepend, &rkey, true);
@@ -1225,14 +1304,35 @@ pgsp_evict_by_relid(Oid dbid, Oid relid, bool dropEntry)
 		if (!entry)
 			continue;
 
+		if (kind == PGSP_UNLOCK)
+		{
+			uint32 prev_lockers PG_USED_FOR_ASSERTS_ONLY;
+
+			prev_lockers = pg_atomic_fetch_sub_u32(&entry->lockers, 1);
+			Assert(prev_lockers > 0);
+		}
+		else if (kind == PGSP_DISCARD_AND_LOCK)
+		{
+			pg_atomic_fetch_add_u32(&entry->lockers, 1);
+			Assert(pg_atomic_read_u32(&entry->lockers) > 0);
+		}
+
 		if (entry->plan == InvalidDsaPointer)
 			continue;
 
-		dsa_free(area, entry->plan);
-		entry->plan = InvalidDsaPointer;
+		if (kind != PGSP_UNLOCK)
+		{
+			Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
 
-		if(dropEntry)
-			hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
+			dsa_free(area, entry->plan);
+			entry->plan = InvalidDsaPointer;
+
+			if (kind != PGSP_EVICT)
+				entry->discard++;
+
+			if(kind == PGSP_EVICT)
+				hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
+		}
 	}
 
 	dshash_release_lock(pgsp_rdepend, rentry);
@@ -1327,7 +1427,6 @@ pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic, pgspHashKey *key,
 		return;
 	}
 
-
 	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
 	entry = pgsp_entry_alloc(key, &context, plantime, num_const,
 							 pgsp_cached_plan_cost(custom, true),
@@ -1394,6 +1493,7 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 {
 	pgspEntry  *entry;
 	bool		found;
+	uint32		lockers;
 
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
 	Assert(context->plan != InvalidDsaPointer);
@@ -1418,6 +1518,7 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 		entry->plantime = plantime;
 		entry->generic_cost = generic_cost;
 		entry->discard = 0;
+		pg_atomic_init_u32(&entry->lockers, 0);
 
 		/* re-initialize the mutex each time ... we assume no one using it */
 		SpinLockInit(&entry->mutex);
@@ -1428,13 +1529,36 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 	}
 	else if (entry->plan == InvalidDsaPointer)
 	{
-		/* Plan was discarded, simply register the new one. */
-		entry->plan = context->plan;
-		entry->discard += 1;
+		/*
+		 * Plan was discarded, simply register the new one if the entry isn't
+		 * lock.  Otherwise we're out of luck and we need to deallocate all the
+		 * data.
+		 */
+		lockers = pg_atomic_read_u32(&entry->lockers);
+		if (lockers != 0)
+		{
+			Oid	   *array = NULL;
+			int		i;
+
+			/* Free the plan. */
+			dsa_free(area, context->plan);
+
+			array = dsa_get_address(area, context->rels);
+			Assert(array != NULL);
+
+			/* Free all saved rdepend. */
+			for (i = 0; i < context->num_rels; i++)
+				pgsp_entry_unregister_rdepend(MyDatabaseId, array[i], key);
+
+			/* And free the array of Oid. */
+			dsa_free(area, context->rels);
+		}
+		else
+			entry->plan = context->plan;
 	}
 
 	/* We should always have a valid handle */
-	Assert(entry->plan != InvalidDsaPointer);
+	Assert(entry->plan != InvalidDsaPointer || lockers > 0);
 
 	return entry;
 }
@@ -1949,7 +2073,7 @@ pg_shared_plans_info(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
-#define PG_SHARED_PLANS_COLS			15
+#define PG_SHARED_PLANS_COLS			16
 Datum
 pg_shared_plans(PG_FUNCTION_ARGS)
 {
@@ -2009,6 +2133,8 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "discard",
 						   INT8OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "lockers",
+						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "relations",
 						   OIDARRAYOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "plans",
@@ -2144,6 +2270,7 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		values[i++] = Float8GetDatumFast(generic_cost);
 		values[i++] = Int32GetDatum(entry->num_rels);
 		values[i++] = Int64GetDatumFast(discard);
+		values[i++] = UInt32GetDatum(pg_atomic_read_u32(&entry->lockers));
 
 		if (showrels)
 		{

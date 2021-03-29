@@ -36,10 +36,10 @@ EXECUTE t_ind(1);
 (1 row)
 
 -- plan should have been discarded once, and kept its previous counters
-SELECT discard, bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
- discard | bypass 
----------+--------
-       1 |      1
+SELECT discard, bypass, lockers FROM pg_shared_plans WHERE query LIKE '%t_ind%';
+ discard | bypass | lockers 
+---------+--------+---------
+       1 |      1 |       0
 (1 row)
 
 CREATE INDEX t_ind_idx ON t_ind (id);
@@ -51,9 +51,24 @@ EXECUTE t_ind(1);
 (1 row)
 
 -- plan should have been discarded twice, and kept its previous counters
-SELECT discard, bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
- discard | bypass 
----------+--------
-       2 |      1
+SELECT discard, bypass, lockers FROM pg_shared_plans WHERE query LIKE '%t_ind%';
+ discard | bypass | lockers 
+---------+--------+---------
+       2 |      1 |       0
+(1 row)
+
+DROP INDEX CONCURRENTLY t_ind_idx;
+-- cached plan should be discarded, entry preserved
+EXECUTE t_ind(1);
+ id 
+----
+  1
+(1 row)
+
+-- plan should have been discarded 3 times, and kept its previous counters
+SELECT discard, bypass, lockers FROM pg_shared_plans WHERE query LIKE '%t_ind%';
+ discard | bypass | lockers 
+---------+--------+---------
+       3 |      1 |       0
 (1 row)
 
