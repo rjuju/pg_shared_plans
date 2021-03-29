@@ -42,3 +42,18 @@ SELECT discard, bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
        1 |      1
 (1 row)
 
+CREATE INDEX t_ind_idx ON t_ind (id);
+-- cached plan should be discarded, entry preserved
+EXECUTE t_ind(1);
+ id 
+----
+  1
+(1 row)
+
+-- plan should have been discarded twice, and kept its previous counters
+SELECT discard, bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
+ discard | bypass 
+---------+--------
+       2 |      1
+(1 row)
+

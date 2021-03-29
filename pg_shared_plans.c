@@ -860,6 +860,17 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				oids_discard = lappend_oid(oids_discard, oid);
 		}
 	}
+	else if (IsA(parsetree, IndexStmt))
+	{
+		IndexStmt  *stmt = (IndexStmt *) parsetree;
+		Oid			relid;
+
+		relid = RangeVarGetRelidExtended(stmt->relation, AccessExclusiveLock,
+				RVR_MISSING_OK, NULL, NULL);
+
+		Assert(OidIsValid(relid));
+		oids_discard = list_append_unique_oid(oids_discard, relid);
+	}
 
 	/*
 	 * Now that the command completed, discard any saved plan or drop the entry
