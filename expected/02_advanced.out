@@ -1,0 +1,275 @@
+-------------------------------
+-- Test some general gotchas --
+-------------------------------
+--
+-- Const detection
+--
+SET pg_shared_plans.min_plan_time = '0ms';
+SET search_path TO public;
+CREATE TABLE small AS SELECT 1 AS id FROM generate_series(1, 10);
+PREPARE limit_a(int) AS SELECT id FROM small WHERE id = $1 LIMIT 1;
+PREPARE limit_b(int) AS SELECT id FROM small WHERE id = $1 LIMIT 2;
+-- Should add the query in shared cache and then bypass planner
+EXECUTE limit_a(1);
+ id 
+----
+  1
+(1 row)
+
+EXECUTE limit_a(1);
+ id 
+----
+  1
+(1 row)
+
+-- Should add the query in shared cache and then bypass planner
+EXECUTE limit_b(1);
+ id 
+----
+  1
+  1
+(2 rows)
+
+EXECUTE limit_b(1);
+ id 
+----
+  1
+  1
+(2 rows)
+
+-- Should find two entries, queries containing const values
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
+    constid != 0 AS has_constid, numconst,
+    plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
+    generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
+FROM public.pg_shared_plans_all pgsp
+WHERE query LIKE '%small%';
+ rolname | bypass | num_custom_plans | nb_rels | has_constid | numconst | has_plantime | has_size | has_generic_cost |      plan_extract       
+---------+--------+------------------+---------+-------------+----------+--------------+----------+------------------+-------------------------
+         |      1 |                1 |       1 | t           |        1 | t            | t        | t                | Limit                  +
+         |        |                  |         |             |          |              |          |                  |   ->  Seq Scan on small+
+         |        |                  |         |             |          |              |          |                  |         Filter: (id 
+         |      1 |                1 |       1 | t           |        1 | t            | t        | t                | Limit                  +
+         |        |                  |         |             |          |              |          |                  |   ->  Seq Scan on small+
+         |        |                  |         |             |          |              |          |                  |         Filter: (id 
+(2 rows)
+
+CREATE TABLE another AS SELECT 1 AS id, 'val' AS val;
+PREPARE where_a(int) AS WITH src AS (SELECT 0 UNION ALL SELECT * FROM (SELECT id FROM another WHERE id = 1) s) SELECT COUNT(*) FROM src;
+PREPARE where_b(int) AS WITH src AS (SELECT 0 UNION ALL SELECT * FROM (SELECT id FROM another WHERE id = 0) s) SELECT COUNT(*) FROM src;
+-- Should add the query in shared cache and then bypass planner
+EXECUTE where_a(1);
+ count 
+-------
+     2
+(1 row)
+
+EXECUTE where_a(1);
+ count 
+-------
+     2
+(1 row)
+
+-- Should add the query in shared cache and then bypass planner
+EXECUTE where_b(1);
+ count 
+-------
+     1
+(1 row)
+
+EXECUTE where_b(1);
+ count 
+-------
+     1
+(1 row)
+
+-- Should find two entries, queries containing const values
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
+    constid != 0 AS has_constid, numconst,
+    plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
+    generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
+FROM public.pg_shared_plans_all pgsp
+WHERE query LIKE '%another%';
+ rolname | bypass | num_custom_plans | nb_rels | has_constid | numconst | has_plantime | has_size | has_generic_cost |    plan_extract    
+---------+--------+------------------+---------+-------------+----------+--------------+----------+------------------+--------------------
+         |      1 |                1 |       1 | t           |        2 | t            | t        | t                | Aggregate         +
+         |        |                  |         |             |          |              |          |                  |   ->  Append      +
+         |        |                  |         |             |          |              |          |                  |         ->  Result+
+         |        |                  |         |             |          |              |          |                  |         
+         |      1 |                1 |       1 | t           |        2 | t            | t        | t                | Aggregate         +
+         |        |                  |         |             |          |              |          |                  |   ->  Append      +
+         |        |                  |         |             |          |              |          |                  |         ->  Result+
+         |        |                  |         |             |          |              |          |                  |         
+(2 rows)
+
+--
+-- RLS
+--
+SET pg_shared_plans.min_plan_time = '0ms';
+SET search_path TO public;
+CREATE USER regress_a;
+CREATE USER regress_b;
+CREATE USER regress_c BYPASSRLS;
+CREATE TABLE mysecretdata(user_name text, secret text, val int);
+GRANT SELECT ON mysecretdata TO public;
+INSERT INTO mysecretdata VALUES ('regress_a', 'one', 1), ('regress_b', 'two', 2);
+ALTER TABLE mysecretdata ENABLE ROW LEVEL SECURITY;
+CREATE POLICY see_self ON mysecretdata FOR SELECT
+    USING (current_user = user_name);
+PREPARE rls (int) AS SELECT * FROM mysecretdata WHERE val < $1;
+-- Make sure plancache won't kick in
+SET plan_cache_mode TO force_custom_plan;
+SET role regress_c;
+EXECUTE rls(10);
+ user_name | secret | val 
+-----------+--------+-----
+ regress_a | one    |   1
+ regress_b | two    |   2
+(2 rows)
+
+EXECUTE rls(10);
+ user_name | secret | val 
+-----------+--------+-----
+ regress_a | one    |   1
+ regress_b | two    |   2
+(2 rows)
+
+SET role regress_a;
+EXECUTE rls(10);
+ user_name | secret | val 
+-----------+--------+-----
+ regress_a | one    |   1
+(1 row)
+
+EXECUTE rls(10);
+ user_name | secret | val 
+-----------+--------+-----
+ regress_a | one    |   1
+(1 row)
+
+SET role regress_b;
+EXECUTE rls(10);
+ user_name | secret | val 
+-----------+--------+-----
+ regress_b | two    |   2
+(1 row)
+
+EXECUTE rls(10);
+ user_name | secret | val 
+-----------+--------+-----
+ regress_b | two    |   2
+(1 row)
+
+SET plan_cache_mode TO auto;
+RESET role;
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
+    plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
+    generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
+FROM public.pg_shared_plans_all pgsp
+WHERE query LIKE '%mysecretdata%'
+ORDER BY rolname COLLATE "C" ASC;
+  rolname  | bypass | num_custom_plans | nb_rels | has_plantime | has_size | has_generic_cost |       plan_extract        
+-----------+--------+------------------+---------+--------------+----------+------------------+---------------------------
+ regress_a |      1 |                1 |       1 | t            | t        | t                | Seq Scan on mysecretdata +
+           |        |                  |         |              |          |                  |   Filter: ((val < $1) AND
+ regress_b |      1 |                1 |       1 | t            | t        | t                | Seq Scan on mysecretdata +
+           |        |                  |         |              |          |                  |   Filter: ((val < $1) AND
+ regress_c |      1 |                1 |       1 | t            | t        | t                | Seq Scan on mysecretdata +
+           |        |                  |         |              |          |                  |   Filter: (val < $1)     +
+           |        |                  |         |              |          |                  | 
+(3 rows)
+
+-- test rdepend filtering
+SELECT 'mysecretdata'::regclass::oid AS mysecretdataoid \gset
+SELECT rolname
+FROM pg_shared_plans(false, false, 0, :mysecretdataoid) pgsp
+LEFT JOIN pg_roles r ON r.oid = pgsp.userid
+ORDER BY rolname COLLATE "C" ASC;
+  rolname  
+-----------
+ regress_a
+ regress_b
+ regress_c
+(3 rows)
+
+-- test partial reset, and rdepend unregister
+SELECT pg_shared_plans_reset('regress_a'::regrole);
+ pg_shared_plans_reset 
+-----------------------
+ 
+(1 row)
+
+SELECT rolname
+FROM pg_shared_plans(false, false, 0, :mysecretdataoid) pgsp
+LEFT JOIN pg_roles r ON r.oid = pgsp.userid
+ORDER BY rolname COLLATE "C" ASC;
+  rolname  
+-----------
+ regress_b
+ regress_c
+(2 rows)
+
+-- Should remove all dependent plans
+DROP TABLE mysecretdata CASCADE;
+SELECT rolname
+FROM pg_shared_plans(false, false, 0, :mysecretdataoid) pgsp
+LEFT JOIN pg_roles r ON r.oid = pgsp.userid
+ORDER BY rolname COLLATE "C" ASC;
+ rolname 
+---------
+(0 rows)
+
+CREATE VIEW myview AS SELECT generate_series(1, 2) id;
+PREPARE myview(integer) AS SELECT * FROM myview WHERE id = $1;
+EXECUTE myview(1);
+ id 
+----
+  1
+(1 row)
+
+EXECUTE myview(1);
+ id 
+----
+  1
+(1 row)
+
+-- Should find a saved plan, with 1 bypass
+SELECT bypass, array_upper(relations, 1) AS nb_rels
+FROM public.pg_shared_plans_all pgsp
+WHERE query LIKE '%myview%';
+ bypass | nb_rels 
+--------+---------
+      1 |       1
+(1 row)
+
+-- Should remove all dependent plans
+DROP VIEW myview;
+SELECT bypass, array_upper(relations, 1) AS nb_rels
+FROM public.pg_shared_plans_all pgsp
+WHERE query LIKE '%myview%';
+ bypass | nb_rels 
+--------+---------
+(0 rows)
+
+--
+-- temp table
+--
+CREATE TEMPORARY TABLE mytemp(id integer);
+PREPARE mytemp(int) AS SELECT * FROM mytemp WHERE id = $1;
+-- Should not add the query in shared cache
+EXECUTE mytemp(1);
+ id 
+----
+(0 rows)
+
+-- Should not find any entry
+SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
+    plantime > 0 AS has_plantime, size != '0 bytes' AS has_size,
+    generic_cost > 0 AS has_generic_cost, substr(plan, 1, 50) AS plan_extract
+FROM public.pg_shared_plans_all pgsp
+WHERE query LIKE '%mytemp%'
+ORDER BY rolname COLLATE "C" ASC;
+ rolname | bypass | num_custom_plans | nb_rels | has_plantime | has_size | has_generic_cost | plan_extract 
+---------+--------+------------------+---------+--------------+----------+------------------+--------------
+(0 rows)
+

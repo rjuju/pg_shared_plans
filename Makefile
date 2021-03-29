@@ -1,9 +1,7 @@
 EXTENSION    = pg_shared_plans
 EXTVERSION   = $(shell grep default_version $(EXTENSION).control | sed -e "s/default_version[[:space:]]*=[[:space:]]*'\([^']*\)'/\1/")
 TESTS        = $(wildcard test/sql/*.sql)
-
-# More test can be added later, after including pgxs
-REGRESS      = pg_shared_plans
+REGRESS      = $(patsubst test/sql/%.sql,%,$(TESTS))
 
 REGRESS_OPTS = --inputdir=test
 

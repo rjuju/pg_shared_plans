@@ -1,0 +1,44 @@
+SELECT pg_shared_plans_reset();
+ pg_shared_plans_reset 
+-----------------------
+ 
+(1 row)
+
+-- Dropped index
+CREATE TABLE t_ind AS SELECT id FROM generate_series(1, 10000) id;
+CREATE INDEX t_ind_idx ON t_ind (id);
+VACUUM ANALYZE t_ind;
+PREPARE t_ind (int) AS SELECT id FROM t_ind WHERE id = $1;
+EXECUTE t_ind(1);
+ id 
+----
+  1
+(1 row)
+
+EXECUTE t_ind(1);
+ id 
+----
+  1
+(1 row)
+
+SELECT discard, bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
+ discard | bypass 
+---------+--------
+       0 |      1
+(1 row)
+
+DROP INDEX t_ind_idx;
+-- cached plan should be discarded, entry preserved
+EXECUTE t_ind(1);
+ id 
+----
+  1
+(1 row)
+
+-- plan should have been discarded once, and kept its previous counters
+SELECT discard, bypass FROM pg_shared_plans WHERE query LIKE '%t_ind%';
+ discard | bypass 
+---------+--------
+       1 |      1
+(1 row)
+
