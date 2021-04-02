@@ -16,23 +16,6 @@
 
 #include "pgsp_import.h"
 
-void
-pgsp_AcquireExecutorLocksOnPartitions(List *partitionOids, int lockmode,
-								 bool acquire)
-{
-	ListCell   *lc;
-
-	foreach(lc, partitionOids)
-	{
-		Oid			partOid = lfirst_oid(lc);
-
-		if (acquire)
-			LockRelationOid(partOid, lockmode);
-		else
-			UnlockRelationOid(partOid, lockmode);
-	}
-}
-
 /*
  * pgsp_ScanQueryForLocks: recursively scan one Query for AcquirePlannerLocks.
  */

@@ -28,8 +28,6 @@
 #endif
 
 
-void pgsp_AcquireExecutorLocksOnPartitions(List *partitionOids, int lockmode,
-								 bool acquire);
 void pgsp_ScanQueryForLocks(Query *parsetree, bool acquire);
 bool pgsp_ScanQueryWalker(Node *node, bool *acquire);
 double pgsp_cached_plan_cost(PlannedStmt *plannedstmt, bool include_planner);
