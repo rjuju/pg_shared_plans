@@ -17,6 +17,8 @@
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/partition.h"
+#include "catalog/pg_inherits.h"
 #if PG_VERSION_NUM < 130000
 #include "catalog/pg_type_d.h"
 #endif
@@ -56,7 +58,8 @@
 #include "utils/timestamp.h"
 #endif
 
-#include "pgsp_import.h"
+#include "include/pgsp_import.h"
+#include "include/pgsp_inherit.h"
 
 PG_MODULE_MAGIC;
 
@@ -66,7 +69,7 @@ PG_MODULE_MAGIC;
 #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every entry_dealloc */
 #define USAGE_DEALLOC_PERCENT	5		/* free this % of entries at once */
 #define PGSP_RDEPEND_INIT		10		/* default rdepend entry array size */
-#define PGSP_RDEPEND_MAX		160		/* max rdepend entry array size */
+#define PGSP_RDEPEND_MAX		5160		/* max rdepend entry array size */
 
 #define PLANCACHE_THRESHOLD		5
 
@@ -860,16 +863,56 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				oids_remove = list_append_unique_oid(oids_remove, oid);
 		}
 	}
+	else if (IsA(parsetree, AlterTableStmt))
+	{
+		AlterTableStmt *atstmt = (AlterTableStmt *) parsetree;
+		LOCKMODE lockmode;
+		ListCell *lc;
 
-	/* For CIC, the index will be unusable in the middle of index_drop, with
-	 * no AEL kept long enough to protect our cache.  So the best we can do
-	 * since we can't hook on the catalog invalidation infrastructure is to
+		lockmode = AlterTableGetLockLevel(atstmt->cmds);
+
+		foreach(lc, atstmt->cmds)
+		{
+			AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+
+			if (cmd->subtype == AT_DetachPartition
+					&& ((PartitionCmd *)cmd->def)->concurrent
+			)
+			{
+				Oid oid;
+
+				/* Ignore if the command is gonna fail. */
+				if (IsTransactionBlock())
+					goto run_utility;
+
+				oid = AlterTableLookupRelation(atstmt, lockmode);
+
+				if (OidIsValid(oid))
+				{
+					/*
+					 * For attaching a partition, we only need to discard plans
+					 * depending on the referenced partitioned table and its
+					 * ancestors.
+					 */
+					oids_lock = list_append_unique_oid(oids_lock, oid);
+					oids_lock = list_concat_unique_oid(oids_lock,
+							get_partition_ancestors(oid));
+				}
+			}
+		}
+	}
+
+	/* For UTILITY with CONCURRENTLY option, the altered object property will
+	 * be changed in the middle of the execution, with no AEL kept long enough
+	 * to protect our cache.  So the best we can do since we can't hook on the
+	 * catalog invalidation infrastructure is to
 	 *  - discard the cache now
-	 *  - lock the dpendent entries to prevent any new plan to be saved
+	 *  - lock the dependent entries to prevent any new plan to be saved
 	 *  - downgrade the lock on pgsp->lock while the entries are lock
 	 *  - hold that shared lock until after standard_ProcessUtility execution
 	 *    and hope this backend won't be killed while the entries are locked,
-	 *    otherwise they would be locked until they get evicted.
+	 *    otherwise they would be locked until they get evicted, either
+	 *    automatically or manually.
 	 */
 	if (oids_lock)
 	{
@@ -926,30 +969,129 @@ run_utility:
 		LOCKMODE    lockmode;
 
 		/*
-		 * Any change that doesn't require an AccessExclusiveLock shouldn't
-		 * impact the plan.  We assume that it's better to discard the plans
-		 * only, hoping that there will be more entries which will still be
-		 * valid after the ALTER TABLE.
+		 * Any change that requires an AccessExclusiveLock should impact the
+		 * plan.  We assume that it's better to discard the plans only, hoping
+		 * that there will be more entries which will still be valid after the
+		 * ALTER TABLE.
+		 * Attaching / detaching partitions also requires cache invalidation.
+		 * Note that CONCURRENT detaching is handled before the UTILITY
+		 * execution due to its non-transactional nature.
 		 */
 		lockmode = AlterTableGetLockLevel(atstmt->cmds);
 		if (lockmode >= AccessExclusiveLock)
 		{
-			Oid         oid = AlterTableLookupRelation(atstmt, lockmode);
+			Oid		oid = AlterTableLookupRelation(atstmt, lockmode);
+			List   *inhs;
 
 			if (OidIsValid(oid))
+			{
 				oids_discard = lappend_oid(oids_discard, oid);
+
+				/*
+				 * We must also discard any plans depending on ancestors, if
+				 * any.
+				 */
+				inhs = pgsp_get_inheritance_ancestors(oid);
+				if (inhs != NIL)
+					oids_discard = list_concat_unique_oid(oids_discard, inhs);
+
+				/* And inheritors, if it's not a DETACH PARTITION. */
+				if (list_length(atstmt->cmds) == 1 &&
+						((AlterTableCmd *) linitial(atstmt->cmds))->subtype !=
+						AT_DetachPartition)
+				{
+					inhs = find_all_inheritors(oid, AccessShareLock, NULL);
+					if (inhs != NIL)
+						oids_discard = list_concat_unique_oid(oids_discard,
+								inhs);
+				}
+			}
+		}
+		else
+		{
+			ListCell *lc;
+
+			foreach(lc, atstmt->cmds)
+			{
+				AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+
+				if (cmd->subtype == AT_AttachPartition ||
+					cmd->subtype == AT_DetachPartitionFinalize ||
+					(cmd->subtype == AT_DetachPartition
+						&& !((PartitionCmd *)cmd->def)->concurrent)
+				)
+				{
+					Oid oid = AlterTableLookupRelation(atstmt, lockmode);
+
+					/* This should require an exclusive lock. */
+					Assert(cmd->subtype != AT_DetachPartition);
+
+					if (OidIsValid(oid))
+					{
+						/*
+						 * For attaching/detaching a partition, we only need to
+						 * discard plans depending on the referenced
+						 * partitioned table and its ancestors.
+						 */
+						oids_discard = list_append_unique_oid(oids_discard, oid);
+						oids_discard = list_concat_unique_oid(oids_discard,
+								get_partition_ancestors(oid));
+					}
+				}
+			}
 		}
 	}
 	else if (IsA(parsetree, IndexStmt))
 	{
 		IndexStmt  *stmt = (IndexStmt *) parsetree;
 		Oid			relid;
+		List	   *inhs;
 
 		relid = RangeVarGetRelidExtended(stmt->relation, AccessExclusiveLock,
 				RVR_MISSING_OK, NULL, NULL);
 
 		Assert(OidIsValid(relid));
 		oids_discard = list_append_unique_oid(oids_discard, relid);
+
+		/* We need to discard cache for all ancestors */
+		inhs = pgsp_get_inheritance_ancestors(relid);
+		if (inhs != NIL)
+			oids_discard = list_concat_unique_oid(oids_discard, inhs);
+
+		/* And also for all inheritors if it's a partitioned table. */
+		if (get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
+		{
+			inhs = find_all_inheritors(relid, AccessShareLock, NULL);
+			if (inhs != NIL)
+				oids_discard = list_concat_unique_oid(oids_discard, inhs);
+		}
+	}
+	else if (IsA(parsetree, CreateStmt))
+	{
+		CreateStmt *stmt = (CreateStmt *) parsetree;
+		ListCell   *lc;
+
+		/*
+		 * If it's an inheritance children, discard all caches depending on any
+		 * of the ancestors.
+		 */
+		foreach(lc, stmt->inhRelations)
+		{
+			RangeVar   *rv = (RangeVar *) lfirst(lc);
+			Oid			oid;
+
+			oid = RangeVarGetRelidExtended(rv, AccessShareLock, RVR_MISSING_OK,
+					NULL, NULL);
+			Assert(OidIsValid(oid));
+			oids_discard = list_append_unique_oid(oids_discard, oid);
+
+			if (stmt->ofTypename)
+				oids_discard = list_concat_unique_oid(oids_discard,
+						get_partition_ancestors(oid));
+			else
+				oids_discard = list_concat_unique_oid(oids_discard,
+						pgsp_get_inheritance_ancestors(oid));
+		}
 	}
 
 	/*
@@ -962,13 +1104,9 @@ run_utility:
 		ListCell *lc;
 
 		if (oids_lock != NIL)
-		{
 			Assert(oids_discard == NULL && oids_remove == NULL);
-		}
 		else
-		{
 			LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-		}
 
 		foreach(lc, oids_discard)
 			pgsp_evict_by_relid(MyDatabaseId, lfirst_oid(lc), PGSP_DISCARD);
@@ -1848,6 +1986,12 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 				if (is_temp)
 					return true;
 			}
+
+			/*
+			 * pg_stat_statements doesn't take into account inheritance query
+			 * (FROM ONLY ... / FROM ... *)
+			 */
+			context->constid = hash_combine(context->constid, entry->inh);
 		}
 
 		return query_tree_walker(query, pgsp_query_walker, context, 0);

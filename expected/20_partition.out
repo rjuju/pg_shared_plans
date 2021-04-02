@@ -1,0 +1,394 @@
+SELECT pg_shared_plans_reset();
+ pg_shared_plans_reset 
+-----------------------
+ 
+(1 row)
+
+-- we'll often discard cached plans, to make sure plancache won't choose its
+-- own cached plans.
+SET plan_cache_mode TO force_custom_plan;
+CREATE TABLE part_list(id1 integer, id2 integer) PARTITION BY LIST (id1);
+PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1;
+EXECUTE part_list(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list(1);
+ id1 
+-----
+(0 rows)
+
+SELECT 't1' t, bypass, discard, query, relation
+FROM ( SELECT *, unnest(relations)::regclass::text AS relation
+       FROM pg_shared_plans_relations WHERE query LIKE '%part_list%') s
+ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
+ t  | bypass | discard |                               query                                | relation  
+----+--------+---------+--------------------------------------------------------------------+-----------
+ t1 |      1 |       0 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1 | part_list
+(1 row)
+
+-- creating a table in a partitioning tree should discard entries depending on
+-- any of the parent partitions
+CREATE TABLE part_list_1 PARTITION OF part_list FOR VALUES IN (1) PARTITION BY LIST (id1);
+PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1;
+-- we need to cache a new plan so it can later be discarded
+EXECUTE part_list(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1(1);
+ id1 
+-----
+(0 rows)
+
+SELECT 't2' t, bypass, discard, query, relation
+FROM ( SELECT *, unnest(relations)::regclass::text AS relation
+       FROM pg_shared_plans_relations WHERE query LIKE '%part_list%') s
+ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
+ t  | bypass | discard |                                 query                                  |  relation   
+----+--------+---------+------------------------------------------------------------------------+-------------
+ t2 |      1 |       1 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1     | part_list
+ t2 |      1 |       0 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1 | part_list_1
+(2 rows)
+
+CREATE TABLE part_list_1_1 PARTITION OF part_list_1 FOR VALUES IN (1);
+PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1;
+-- we need to cache new plans so it can later be discarded
+EXECUTE part_list(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_1(1);
+ id1 
+-----
+(0 rows)
+
+SELECT 't3' t, bypass, discard, query, relation
+FROM ( SELECT *, unnest(relations)::regclass::text AS relation
+       FROM pg_shared_plans_relations WHERE query LIKE '%part_list%') s
+ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
+ t  | bypass | discard |                                   query                                    |   relation    
+----+--------+---------+----------------------------------------------------------------------------+---------------
+ t3 |      1 |       2 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t3 |      1 |       1 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t3 |      1 |       0 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
+(3 rows)
+
+CREATE INDEX ON part_list_1_1(id1);
+-- we need to cache new plans so it can later be discarded
+EXECUTE part_list(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_1(1);
+ id1 
+-----
+(0 rows)
+
+SELECT 't4' t, bypass, discard, query, relation
+FROM ( SELECT *, unnest(relations)::regclass::text AS relation
+       FROM pg_shared_plans_relations WHERE query LIKE '%part_list%') s
+ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
+ t  | bypass | discard |                                   query                                    |   relation    
+----+--------+---------+----------------------------------------------------------------------------+---------------
+ t4 |      1 |       3 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t4 |      1 |       2 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t4 |      1 |       1 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
+(3 rows)
+
+BEGIN;
+CREATE INDEX ON part_list(id1);
+ROLLBACK;
+-- we need to cache new plans so it can later be discarded
+EXECUTE part_list(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_1(1);
+ id1 
+-----
+(0 rows)
+
+SELECT 't5a' t, bypass, discard, query, relation
+FROM ( SELECT *, unnest(relations)::regclass::text AS relation
+       FROM pg_shared_plans_relations WHERE query LIKE '%part_list%') s
+ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
+  t  | bypass | discard |                                   query                                    |   relation    
+-----+--------+---------+----------------------------------------------------------------------------+---------------
+ t5a |      1 |       4 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t5a |      1 |       3 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t5a |      1 |       2 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
+(3 rows)
+
+BEGIN;
+CREATE INDEX ON part_list(id1);
+COMMIT;
+-- we need to cache new plans so it can later be discarded
+EXECUTE part_list(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_1(1);
+ id1 
+-----
+(0 rows)
+
+SELECT 't5b' t, bypass, discard, query, relation
+FROM ( SELECT *, unnest(relations)::regclass::text AS relation
+       FROM pg_shared_plans_relations WHERE query LIKE '%part_list%') s
+ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
+  t  | bypass | discard |                                   query                                    |   relation    
+-----+--------+---------+----------------------------------------------------------------------------+---------------
+ t5b |      1 |       5 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t5b |      1 |       4 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t5b |      1 |       3 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
+(3 rows)
+
+-- should not discard anything
+CREATE TABLE part_list_1_2(id1 integer, id2 integer);
+PREPARE part_list_1_2(int) AS SELECT id1 FROM part_list_1_2 WHERE id1 = $1;
+EXECUTE part_list(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_2(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_2(1);
+ id1 
+-----
+(0 rows)
+
+SELECT 't6' t, bypass, discard, query, relation
+FROM ( SELECT *, unnest(relations)::regclass::text AS relation
+       FROM pg_shared_plans_relations WHERE query LIKE '%part_list%') s
+ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
+ t  | bypass | discard |                                   query                                    |   relation    
+----+--------+---------+----------------------------------------------------------------------------+---------------
+ t6 |      2 |       5 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t6 |      2 |       4 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t6 |      2 |       3 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
+ t6 |      1 |       0 | PREPARE part_list_1_2(int) AS SELECT id1 FROM part_list_1_2 WHERE id1 = $1 | part_list_1_2
+(4 rows)
+
+-- Should only discard plans depending on part_list_1 and part_list
+ALTER TABLE part_list_1 ATTACH PARTITION part_list_1_2 FOR VALUES IN (2);
+EXECUTE part_list(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_2(1);
+ id1 
+-----
+(0 rows)
+
+SELECT 't7' t, bypass, discard, query, relation
+FROM ( SELECT *, unnest(relations)::regclass::text AS relation
+       FROM pg_shared_plans_relations WHERE query LIKE '%part_list%') s
+ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
+ t  | bypass | discard |                                   query                                    |   relation    
+----+--------+---------+----------------------------------------------------------------------------+---------------
+ t7 |      2 |       6 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t7 |      2 |       5 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t7 |      3 |       3 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
+ t7 |      2 |       0 | PREPARE part_list_1_2(int) AS SELECT id1 FROM part_list_1_2 WHERE id1 = $1 | part_list_1_2
+(4 rows)
+
+-- Should only discard plans depending on part_list_1 and part_list
+ALTER TABLE part_list_1 DETACH PARTITION part_list_1_2;
+EXECUTE part_list(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_2(1);
+ id1 
+-----
+(0 rows)
+
+SELECT 't8' t, bypass, discard, query, relation
+FROM ( SELECT *, unnest(relations)::regclass::text AS relation
+       FROM pg_shared_plans_relations WHERE query LIKE '%part_list%') s
+ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
+ t  | bypass | discard |                                   query                                    |   relation    
+----+--------+---------+----------------------------------------------------------------------------+---------------
+ t8 |      2 |       7 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t8 |      2 |       6 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t8 |      4 |       3 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
+ t8 |      3 |       0 | PREPARE part_list_1_2(int) AS SELECT id1 FROM part_list_1_2 WHERE id1 = $1 | part_list_1_2
+(4 rows)
+
+-- Should discard all plans depending on still attached partitions
+ALTER TABLE part_list ALTER COLUMN id2 TYPE bigint;
+EXECUTE part_list(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_2(1);
+ id1 
+-----
+(0 rows)
+
+SELECT 't9' t, bypass, discard, query, relation
+FROM ( SELECT *, unnest(relations)::regclass::text AS relation
+       FROM pg_shared_plans_relations WHERE query LIKE '%part_list%') s
+ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
+ t  | bypass | discard |                                   query                                    |   relation    
+----+--------+---------+----------------------------------------------------------------------------+---------------
+ t9 |      2 |       8 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t9 |      2 |       7 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t9 |      4 |       4 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
+ t9 |      4 |       0 | PREPARE part_list_1_2(int) AS SELECT id1 FROM part_list_1_2 WHERE id1 = $1 | part_list_1_2
+(4 rows)
+
+-- Should only discard plans depending on part_list_1 and part_list
+ALTER TABLE part_list_1 DETACH PARTITION part_list_1_1 CONCURRENTLY;
+EXECUTE part_list(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_2(1);
+ id1 
+-----
+(0 rows)
+
+SELECT 't10' t, bypass, discard, query, relation
+FROM ( SELECT *, unnest(relations)::regclass::text AS relation
+       FROM pg_shared_plans_relations WHERE query LIKE '%part_list%') s
+ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
+  t  | bypass | discard |                                   query                                    |   relation    
+-----+--------+---------+----------------------------------------------------------------------------+---------------
+ t10 |      2 |       9 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t10 |      2 |       8 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t10 |      5 |       4 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
+ t10 |      5 |       0 | PREPARE part_list_1_2(int) AS SELECT id1 FROM part_list_1_2 WHERE id1 = $1 | part_list_1_2
+(4 rows)
+
+ALTER TABLE part_list_1 ATTACH PARTITION part_list_1_1 FOR VALUES IN (1);
+INSERT INTO part_list SELECT 1, 2;
+PREPARE select_part_1(int) AS SELECT * FROM part_list WHERE id1 <= $1;
+-- pg_stat_statements will generate the same queryid for this query, make sure
+-- we see it as a different one
+PREPARE select_part_2(int) AS SELECT * FROM ONLY part_list WHERE id1 <= $1;
+EXECUTE select_part_1(1);
+ id1 | id2 
+-----+-----
+   1 |   2
+(1 row)
+
+EXECUTE select_part_1(1);
+ id1 | id2 
+-----+-----
+   1 |   2
+(1 row)
+
+EXECUTE select_part_2(1);
+ id1 | id2 
+-----+-----
+(0 rows)
+
+EXECUTE select_part_2(1);
+ id1 | id2 
+-----+-----
+(0 rows)
+
+-- We should see 2 entries, each having bypassed the planner once
+SELECT 't11' t, bypass FROM pg_shared_plans WHERE query LIKE '%id1 <=%';
+  t  | bypass 
+-----+--------
+ t11 |      1
+ t11 |      1
+(2 rows)
+

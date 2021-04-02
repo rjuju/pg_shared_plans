@@ -14,7 +14,7 @@
 
 #include "optimizer/optimizer.h"
 
-#include "pgsp_import.h"
+#include "include/pgsp_import.h"
 
 /*
  * pgsp_ScanQueryForLocks: recursively scan one Query for AcquirePlannerLocks.
