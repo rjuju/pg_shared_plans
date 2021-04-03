@@ -140,3 +140,14 @@ SELECT rolname, bypass, num_custom_plans, array_upper(relations, 1) AS nb_rels,
 FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%mytemp%'
 ORDER BY rolname COLLATE "C" ASC;
+
+-- ACL on functions
+PREPARE cast_bigint(int) AS SELECT (ARRAY [$1])::int4[]::bigint[];
+BEGIN;
+EXECUTE cast_bigint(1);
+EXECUTE cast_bigint(1);
+REVOKE ALL ON FUNCTION int8(integer) FROM PUBLIC;
+EXECUTE cast_bigint(1); -- superuser, succeed
+SET SESSION AUTHORIZATION regress_a;
+EXECUTE cast_bigint(1); -- other user, fail
+ROLLBACK;

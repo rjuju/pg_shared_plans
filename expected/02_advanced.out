@@ -273,3 +273,29 @@ ORDER BY rolname COLLATE "C" ASC;
 ---------+--------+------------------+---------+--------------+----------+------------------+--------------
 (0 rows)
 
+-- ACL on functions
+PREPARE cast_bigint(int) AS SELECT (ARRAY [$1])::int4[]::bigint[];
+BEGIN;
+EXECUTE cast_bigint(1);
+ array 
+-------
+ {1}
+(1 row)
+
+EXECUTE cast_bigint(1);
+ array 
+-------
+ {1}
+(1 row)
+
+REVOKE ALL ON FUNCTION int8(integer) FROM PUBLIC;
+EXECUTE cast_bigint(1); -- superuser, succeed
+ array 
+-------
+ {1}
+(1 row)
+
+SET SESSION AUTHORIZATION regress_a;
+EXECUTE cast_bigint(1); -- other user, fail
+ERROR:  permission denied for function int8
+ROLLBACK;

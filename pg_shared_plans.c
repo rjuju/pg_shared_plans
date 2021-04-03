@@ -48,6 +48,7 @@
 #include "tcop/cmdtag.h"
 #endif
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/guc.h"
@@ -2004,6 +2005,19 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 		context->constid = hash_combine(context->constid,
 										hash_any((unsigned char *) r, len));
 		context->num_const++;
+	}
+	else if (IsA(node, FuncExpr))
+	{
+		Oid			funcid = ((FuncExpr *) node)->funcid;
+		AclResult	aclresult;
+
+		aclresult = pg_proc_aclcheck(funcid, GetUserId(), ACL_EXECUTE);
+		/*
+		 * The query is going to error out,so abort now and let
+		 * standard_planner raise the error.
+		 */
+		if (aclresult != ACLCHECK_OK)
+			return true;
 	}
 
 	return expression_tree_walker(node, pgsp_query_walker, context);
