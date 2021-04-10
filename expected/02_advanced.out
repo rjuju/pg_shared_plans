@@ -299,3 +299,50 @@ SET SESSION AUTHORIZATION regress_a;
 EXECUTE cast_bigint(1); -- other user, fail
 ERROR:  permission denied for function int8
 ROLLBACK;
+-- Rules
+CREATE TABLE rule_1(id integer, val text);
+CREATE TABLE rule_2(id integer, val text);
+CREATE TABLE rule_3(id integer, val text);
+INSERT INTO rule_1 VALUES (1, 'val 1');
+INSERT INTO rule_2 VALUES (1, 'val 1');
+INSERT INTO rule_3 VALUES (1, 'val 1');
+PREPARE upd_rule_1(int, text) AS UPDATE rule_1 SET val = $2 WHERE id = $1;
+-- without rule, we will cache a plan and then bypass the planner
+EXECUTE upd_rule_1(0, 'noop');
+EXECUTE upd_rule_1(0, 'noop');
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%rule_1%';
+ bypass 
+--------
+      1
+(1 row)
+
+CREATE RULE rule_test AS ON UPDATE TO rule_1 DO ALSO (
+    UPDATE rule_2 SET val = new.val WHERE val = old.val;
+    UPDATE rule_3 SET val = new.val WHERE val = old.val;
+);
+-- now that we have a rule, we shouldn't use the saved plan anymore
+EXECUTE upd_rule_1(1, 'new val');
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%rule_1%';
+ bypass 
+--------
+      1
+(1 row)
+
+SELECT * FROM rule_1;
+ id |   val   
+----+---------
+  1 | new val
+(1 row)
+
+SELECT * FROM rule_2;
+ id |   val   
+----+---------
+  1 | new val
+(1 row)
+
+SELECT * FROM rule_3;
+ id |   val   
+----+---------
+  1 | new val
+(1 row)
+

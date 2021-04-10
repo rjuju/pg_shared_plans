@@ -1986,6 +1986,20 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 
 				if (is_temp)
 					return true;
+
+				/*
+				 * pg_stat_statements doesn't compute a different queryid for
+				 * underlying queries issued by rules, so we can only handle
+				 * simple views having only a single _RETURN rule.
+				 */
+				if (rel->rd_rules)
+				{
+					if (get_rel_relkind(entry->relid) != RELKIND_VIEW)
+						return true;
+
+					if (rel->rd_rules->numLocks > 1)
+						return true;
+				}
 			}
 
 			/*
