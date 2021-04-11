@@ -736,14 +736,6 @@ fallback:
  * needs to be handled:
  *
  * - find all the impacted relations in case of CASCADEd utility
- * - this approach is only safe if the UTILITY requires an AccessExclusiveLock.
- *   Therefore any of the CONCURRENTLY version of UTILITY will void current
- *   assumption.  Find a way to deal with it :)
- * - if this UTILITY is dropping one of the rtable entry, we should evict
- *   entirely the entry from the main hash table rather than discarding the
- *   plan.
- * - we should also discard plans when new indexes are added
- * - lot of work needed for partitioning
  * - only RELATIONs are handled.  What about functions, operators...
  * - client should not be able to override pg_shared_plans.read_only if we set
  *   it here.
@@ -797,7 +789,6 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 					Oid			indoid, heapoid;
 
 					/*
-					 * FIXME: see how to handle DROP CONCURRENTLY
 					 * XXX: is it really ok to ignore permissions here, as
 					 * standard_ProcessUtility will fail before we actually use
 					 * the generated list?
