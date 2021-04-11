@@ -141,7 +141,9 @@ FROM public.pg_shared_plans_all pgsp
 WHERE query LIKE '%mytemp%'
 ORDER BY rolname COLLATE "C" ASC;
 
+--
 -- ACL on functions
+--
 PREPARE cast_bigint(int) AS SELECT (ARRAY [$1])::int4[]::bigint[];
 BEGIN;
 EXECUTE cast_bigint(1);
@@ -152,7 +154,9 @@ SET SESSION AUTHORIZATION regress_a;
 EXECUTE cast_bigint(1); -- other user, fail
 ROLLBACK;
 
+--
 -- Rules
+--
 CREATE TABLE rule_1(id integer, val text);
 CREATE TABLE rule_2(id integer, val text);
 CREATE TABLE rule_3(id integer, val text);
@@ -181,3 +185,50 @@ SELECT bypass FROM pg_shared_plans WHERE query LIKE '%rule_1%';
 SELECT * FROM rule_1;
 SELECT * FROM rule_2;
 SELECT * FROM rule_3;
+
+--
+-- Grouping Sets
+--
+PREPARE rollup_1(int) AS SELECT (
+    SELECT (
+        SELECT GROUPING(a,b) FROM (VALUES ($1)) v2(c)
+    ) FROM (VALUES (1,2)) v1(a,b) GROUP BY (a,b)
+) FROM (VALUES(6,7)) v3(e,f) GROUP BY ROLLUP(e,f);
+
+-- pg_stat_statements will generate the same queryid for this query, make sure
+-- we see it as a different one
+PREPARE rollup_2(int) AS SELECT (
+    SELECT (
+        SELECT GROUPING(e,f) FROM (VALUES ($1)) v2(c)
+    ) FROM (VALUES (1,2)) v1(a,b) GROUP BY (a,b)
+) FROM (VALUES(6,7)) v3(e,f) GROUP BY ROLLUP(e,f);
+
+EXECUTE rollup_1(1);
+EXECUTE rollup_1(1);
+
+EXECUTE rollup_2(1);
+EXECUTE rollup_2(1);
+
+-- We should see 2 entries, each having bypassed the planner once
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%v1(a,b)%';
+
+PREPARE groupby_1(int) AS SELECT a, b, c
+ FROM (VALUES ($1, 2, 3), (4, NULL, 6), (7, 8, 9)) AS t (a, b, c)
+ GROUP BY ROLLUP(a, b), rollup(a, c)
+ ORDER BY a, b, c;
+
+-- pg_stat_statements will generate the same queryid for this query, make sure
+-- we see it as a different one
+PREPARE groupby_2(int) AS SELECT a, b, c
+ FROM (VALUES ($1, 2, 3), (4, NULL, 6), (7, 8, 9)) AS t (a, b, c)
+ GROUP BY DISTINCT ROLLUP(a, b), rollup(a, c)
+ ORDER BY a, b, c;
+
+EXECUTE groupby_1(1);
+EXECUTE groupby_1(1);
+
+EXECUTE groupby_2(1);
+EXECUTE groupby_2(1);
+
+-- We should see 2 entries, each having bypassed the planner once
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%SELECT a, b, c%';

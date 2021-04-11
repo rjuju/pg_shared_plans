@@ -2000,6 +2000,9 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 			context->constid = hash_combine(context->constid, entry->inh);
 		}
 
+		/* pg_stat_statements doesn't take into account groupDistinct */
+		context->constid = hash_combine(context->constid, query->groupDistinct);
+
 		return query_tree_walker(query, pgsp_query_walker, context, 0);
 	}
 	else if (IsA(node, Const))
@@ -2023,6 +2026,13 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 		 */
 		if (aclresult != ACLCHECK_OK)
 			return true;
+	}
+	else if (IsA(node, GroupingFunc))
+	{
+		GroupingFunc *gf = (GroupingFunc *) node;
+
+		/* pg_stat_statement doesn't take into account agglevelsup */
+		context->constid = hash_combine(context->constid, gf->agglevelsup);
 	}
 
 	return expression_tree_walker(node, pgsp_query_walker, context);
