@@ -1998,6 +1998,13 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 			 * (FROM ONLY ... / FROM ... *)
 			 */
 			context->constid = hash_combine(context->constid, entry->inh);
+
+			/*
+			 * pg_stat_statements doesn't take into account the limit option
+			 * (ONLY / WITH TIES).
+			 */
+			context->constid = hash_combine(context->constid,
+											query->limitOption);
 		}
 
 		/* pg_stat_statements doesn't take into account groupDistinct */
