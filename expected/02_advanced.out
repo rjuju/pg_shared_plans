@@ -665,3 +665,49 @@ SELECT bypass FROM pg_shared_plans WHERE query LIKE '%colname_bis%';
       1
 (2 rows)
 
+--
+-- TEXT SEARCH DICTIONARY
+--
+CREATE TEXT SEARCH DICTIONARY synonym (
+						Template=synonym,
+						Synonyms=synonym_sample
+);
+PREPARE ts_lexize(text) AS SELECT ts_lexize('synonym', $1);
+EXECUTE ts_lexize('PoStGrEs');
+ ts_lexize 
+-----------
+ {pgsql}
+(1 row)
+
+EXECUTE ts_lexize('PoStGrEs');
+ ts_lexize 
+-----------
+ {pgsql}
+(1 row)
+
+-- plan should be cached and bypassed planner once
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%ts_lexize%';
+ bypass 
+--------
+      1
+(1 row)
+
+-- Should evict all plans for current database
+ALTER TEXT SEARCH DICTIONARY synonym (CaseSensitive = 1);
+-- Note that this statement will not fail as the current backend will receive
+-- an invalidation for the dictionnary, but there's no guarantee that other
+-- backends will.
+EXECUTE ts_lexize('PoStGrEs');
+ ts_lexize 
+-----------
+ 
+(1 row)
+
+-- We should see only 1 entry for the current database, which never bypassed
+-- the planner
+SELECT bypass FROM pg_shared_plans WHERE datname = current_database();
+ bypass 
+--------
+      0
+(1 row)
+

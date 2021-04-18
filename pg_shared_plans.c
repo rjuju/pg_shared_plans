@@ -234,6 +234,7 @@ static void pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 								);
 
 static void pgsp_attach_dsa(void);
+static void pg_shared_plans_reset_internal(Oid userid, Oid dbid, uint64 queryid);
 static void pg_shared_plans_shutdown(Datum arg);
 
 static int pgsp_rdepend_fn_compare(const void *a, const void *b, size_t size,
@@ -757,6 +758,7 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	List   *oids_discard = NIL,
 		   *oids_remove = NIL,
 		   *oids_lock = NIL;
+	bool	reset_current_db = false;
 
 	/* Create or attach to the dsa. */
 	pgsp_attach_dsa();
@@ -893,6 +895,28 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 			}
 		}
 	}
+	else if (IsA(parsetree, AlterTSDictionaryStmt))
+	{
+		/* We have no way to track dependencies on TEXT SEARCH DICTIONNARY, so
+		 * the only way to avoid returning false result is to entirely drop the
+		 * cache for the current database.  Hopefully such commands should not
+		 * be frequent so it won't be a big issue.
+		 * Note that to properly test this behavior you need multiple backends
+		 * as the one executing the ALTER TEXT SEARCH DICTIONNARY wilL discard
+		 * his own cache.
+		 * Note also that to ensure a correct behavior we have to make sure
+		 * that the command isn't run in a transaction (done here), and we will
+		 * only drop the cached plans after the UTILITY has been executed.
+		 * XXX It's still possible that someone locally deactivate
+		 *     pg_shared_plans before executing such a command, which would be
+		 *     bad, or that another backend cache a new plan between the reset
+		 *     and the commit of the ALTER TEXT SELECT DICTIONARY.
+		*/
+		if(IsTransactionBlock())
+			elog(ERROR, "pg_shared_plans: can't run ALTER TEXT SEARCH"
+					" DICTIONNARY in a transaction.");
+		reset_current_db = true;
+	}
 
 	/* For UTILITY with CONCURRENTLY option, the altered object property will
 	 * be changed in the middle of the execution, with no AEL kept long enough
@@ -954,6 +978,19 @@ run_utility:
 				completionTag
 #endif
 				);
+
+	if (reset_current_db)
+	{
+		Assert(IsA(parsetree, AlterTSDictionaryStmt));
+		Assert(oids_discard == NIL && oids_remove == NIL && oids_lock == NIL);
+
+		pg_shared_plans_reset_internal(InvalidOid, MyDatabaseId,
+				UINT64CONST (0));
+
+		return;
+	}
+
+	Assert(!reset_current_db);
 
 	if (IsA(parsetree, AlterTableStmt))
 	{
@@ -1164,6 +1201,85 @@ pgsp_attach_dsa(void)
 	MemoryContextSwitchTo(oldcontext);
 
 	Assert(area != NULL);
+}
+
+static void
+pg_shared_plans_reset_internal(Oid userid, Oid dbid, uint64 queryid)
+{
+	HASH_SEQ_STATUS hash_seq;
+	pgspEntry  *entry;
+	long		num_entries;
+	long		num_remove = 0;
+	//pgspHashKey key;
+
+	/* Create or attach to the dsa. */
+	pgsp_attach_dsa();
+
+	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
+	num_entries = hash_get_num_entries(pgsp_hash);
+
+	/* No fastpath yet, should user care of a specific constid? */
+	//if (userid != 0 && dbid != 0 && queryid != UINT64CONST(0))
+	//{
+	//	/* If all the parameters are available, use the fast path. */
+	//	key.userid = userid;
+	//	key.dbid = dbid;
+	//	key.queryid = queryid;
+
+	//	/* Remove the key if exists */
+	//	entry = (pgspEntry *) hash_search(pgsp_hash, &key, HASH_FIND, NULL);
+
+	//	if (entry)
+	//	{
+	//		pgsp_entry_remove(entry);
+	//		num_remove++;
+	//	}
+	//}
+	//else
+	if (userid != 0 || dbid != 0 || queryid != UINT64CONST(0))
+	{
+		/* Remove entries corresponding to valid parameters. */
+		hash_seq_init(&hash_seq, pgsp_hash);
+		while ((entry = hash_seq_search(&hash_seq)) != NULL)
+		{
+			if ((!userid || entry->key.userid == userid) &&
+				(!dbid || entry->key.dbid == dbid) &&
+				(!queryid || entry->key.queryid == queryid))
+			{
+				pgsp_entry_remove(entry);
+				num_remove++;
+			}
+		}
+	}
+	else
+	{
+		/* Remove all entries. */
+		hash_seq_init(&hash_seq, pgsp_hash);
+		while ((entry = hash_seq_search(&hash_seq)) != NULL)
+		{
+			pgsp_entry_remove(entry);
+			num_remove++;
+		}
+	}
+
+	/* All entries are removed? */
+	if (num_entries == num_remove)
+	{
+		volatile pgspSharedState *s = (volatile pgspSharedState *) pgsp;
+
+		/*
+		 * Reset global statistics for pg_shared_plans since all entries are
+		 * removed.
+		 */
+		TimestampTz stats_reset = GetCurrentTimestamp();
+
+		SpinLockAcquire(&s->mutex);
+		s->dealloc = 0;
+		s->stats_reset = stats_reset;
+		SpinLockRelease(&s->mutex);
+	}
+
+	LWLockRelease(pgsp->lock);
 }
 
 /* Release pgsp->lock that was acquired during pg_shared_plans(). */
@@ -2165,11 +2281,6 @@ do_showplans(dsa_pointer plan)
 Datum
 pg_shared_plans_reset(PG_FUNCTION_ARGS)
 {
-	HASH_SEQ_STATUS hash_seq;
-	pgspEntry  *entry;
-	long		num_entries;
-	long		num_remove = 0;
-	//pgspHashKey key;
 	Oid			userid;
 	Oid			dbid;
 	uint64		queryid;
@@ -2183,74 +2294,7 @@ pg_shared_plans_reset(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("pg_shared_plans must be loaded via shared_preload_libraries")));
 
-	/* Create or attach to the dsa. */
-	pgsp_attach_dsa();
-
-	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-	num_entries = hash_get_num_entries(pgsp_hash);
-
-	/* No fastpath yet, should user care of a specific constid? */
-	//if (userid != 0 && dbid != 0 && queryid != UINT64CONST(0))
-	//{
-	//	/* If all the parameters are available, use the fast path. */
-	//	key.userid = userid;
-	//	key.dbid = dbid;
-	//	key.queryid = queryid;
-
-	//	/* Remove the key if exists */
-	//	entry = (pgspEntry *) hash_search(pgsp_hash, &key, HASH_FIND, NULL);
-
-	//	if (entry)
-	//	{
-	//		pgsp_entry_remove(entry);
-	//		num_remove++;
-	//	}
-	//}
-	//else
-	if (userid != 0 || dbid != 0 || queryid != UINT64CONST(0))
-	{
-		/* Remove entries corresponding to valid parameters. */
-		hash_seq_init(&hash_seq, pgsp_hash);
-		while ((entry = hash_seq_search(&hash_seq)) != NULL)
-		{
-			if ((!userid || entry->key.userid == userid) &&
-				(!dbid || entry->key.dbid == dbid) &&
-				(!queryid || entry->key.queryid == queryid))
-			{
-				pgsp_entry_remove(entry);
-				num_remove++;
-			}
-		}
-	}
-	else
-	{
-		/* Remove all entries. */
-		hash_seq_init(&hash_seq, pgsp_hash);
-		while ((entry = hash_seq_search(&hash_seq)) != NULL)
-		{
-			pgsp_entry_remove(entry);
-			num_remove++;
-		}
-	}
-
-	/* All entries are removed? */
-	if (num_entries == num_remove)
-	{
-		volatile pgspSharedState *s = (volatile pgspSharedState *) pgsp;
-
-		/*
-		 * Reset global statistics for pg_shared_plans since all entries are
-		 * removed.
-		 */
-		TimestampTz stats_reset = GetCurrentTimestamp();
-
-		SpinLockAcquire(&s->mutex);
-		s->dealloc = 0;
-		s->stats_reset = stats_reset;
-		SpinLockRelease(&s->mutex);
-	}
-
-	LWLockRelease(pgsp->lock);
+	pg_shared_plans_reset_internal(userid, dbid, queryid);
 
 	PG_RETURN_VOID();
 }
