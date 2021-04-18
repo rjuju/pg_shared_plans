@@ -257,3 +257,35 @@ EXECUTE limitoption_2(5);
 
 -- We should see 2 entries, each having bypassed the planner once
 SELECT bypass FROM pg_shared_plans WHERE query LIKE '%limitoption%';
+
+--
+-- alias' colnames
+--
+CREATE TABLE colname AS SELECT 0 AS id, 'zero' AS val;
+PREPARE colname_1(int) AS SELECT row_to_json(t) FROM colname t WHERE id = $1;
+-- pg_stat_statements will generate the same queryid for this query, make sure
+-- we see it as a different one
+PREPARE colname_2(int) AS SELECT row_to_json(t) FROM colname t(a, b) WHERE a = $1;
+
+EXECUTE colname_1(0);
+EXECUTE colname_1(0);
+EXECUTE colname_2(0);
+EXECUTE colname_2(0);
+
+-- We should see 2 entries, each having bypassed the planner once
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%row_to_json%';
+
+PREPARE colname_3(int) AS SELECT row_to_json(colname_bis)
+    FROM (SELECT id, val FROM colname) AS colname_bis;
+-- pg_stat_statements will generate the same queryid for this query, make sure
+-- we see it as a different one
+PREPARE colname_4(int) AS SELECT row_to_json(colname_bis)
+    FROM (SELECT id AS a, val AS b FROM colname) AS colname_bis;
+
+EXECUTE colname_3(0);
+EXECUTE colname_3(0);
+EXECUTE colname_4(0);
+EXECUTE colname_4(0);
+
+-- We should see 2 entries, each having bypassed the planner once
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%colname_bis%';

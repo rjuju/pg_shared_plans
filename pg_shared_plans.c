@@ -1965,11 +1965,11 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 
 		foreach(lc, query->rtable)
 		{
-			RangeTblEntry *entry = lfirst_node(RangeTblEntry, lc);
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
 
-			if (entry->rtekind == RTE_RELATION)
+			if (rte->rtekind == RTE_RELATION)
 			{
-				Relation rel = relation_open(entry->relid, AccessShareLock);
+				Relation rel = relation_open(rte->relid, AccessShareLock);
 				bool is_temp;
 
 				is_temp = RelationUsesLocalBuffers(rel);
@@ -1985,7 +1985,7 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 				 */
 				if (rel->rd_rules)
 				{
-					if (get_rel_relkind(entry->relid) != RELKIND_VIEW)
+					if (get_rel_relkind(rte->relid) != RELKIND_VIEW)
 						return true;
 
 					if (rel->rd_rules->numLocks > 1)
@@ -1997,7 +1997,7 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 			 * pg_stat_statements doesn't take into account inheritance query
 			 * (FROM ONLY ... / FROM ... *)
 			 */
-			context->constid = hash_combine(context->constid, entry->inh);
+			context->constid = hash_combine(context->constid, rte->inh);
 
 			/*
 			 * pg_stat_statements doesn't take into account the limit option
@@ -2005,10 +2005,50 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 			 */
 			context->constid = hash_combine(context->constid,
 											query->limitOption);
+
+			/*
+			 * pg_stat_statements doesn't take into account the alias colnames,
+			 * which may sound sensible, but some things will actually return
+			 * different result if the alias changes, like row_to_json().
+			 */
+			if (rte->alias && rte->alias->colnames)
+			{
+				ListCell *lc2;
+
+				foreach(lc2, rte->alias->colnames)
+				{
+					unsigned char  *colname = (unsigned char *) lfirst(lc2);
+					int				len = strlen((char *) colname);
+
+					context->constid = hash_combine(context->constid,
+													hash_any(colname, len));
+				}
+			}
 		}
 
 		/* pg_stat_statements doesn't take into account groupDistinct */
 		context->constid = hash_combine(context->constid, query->groupDistinct);
+
+		/*
+		 * pg_stat_statements doesn't take into account the alias colnames,
+		 * which is normal, but some things will actually return
+		 * different result if the alias changes, like row_to_json().
+		 */
+		foreach(lc, query->targetList)
+		{
+			TargetEntry	   *te = (TargetEntry *) lfirst(lc);
+			unsigned char  *n;
+			int				len;
+
+			if (!te->resname)
+				continue;
+
+			n = (unsigned char *) te->resname;
+			len = strlen(te->resname);
+
+			context->constid = hash_combine(context->constid,
+											hash_any(n, len));
+		}
 
 		return query_tree_walker(query, pgsp_query_walker, context, 0);
 	}
