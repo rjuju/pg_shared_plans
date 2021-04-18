@@ -59,8 +59,10 @@
 #include "utils/timestamp.h"
 #endif
 
+#include "include/pg_shared_plans.h"
 #include "include/pgsp_import.h"
 #include "include/pgsp_inherit.h"
+#include "include/pgsp_rdepend.h"
 
 PG_MODULE_MAGIC;
 
@@ -69,8 +71,6 @@ PG_MODULE_MAGIC;
 #define ASSUMED_MEDIAN_INIT		(10.0)	/* initial assumed median usage */
 #define USAGE_DECREASE_FACTOR	(0.99)	/* decreased every entry_dealloc */
 #define USAGE_DEALLOC_PERCENT	5		/* free this % of entries at once */
-#define PGSP_RDEPEND_INIT		10		/* default rdepend entry array size */
-#define PGSP_RDEPEND_MAX		5160		/* max rdepend entry array size */
 
 #define PLANCACHE_THRESHOLD		5
 
@@ -82,55 +82,6 @@ typedef enum pgspEvictionKind
 	PGSP_EVICT
 } pgspEvictionKind;
 
-
-typedef struct pgspHashKey
-{
-	Oid			userid;		/* user OID is plans has RLS */
-	Oid			dbid;		/* database OID */
-	uint64		queryid;	/* query identifier */
-	uint32		constid;	/* hash of the consts still present */
-} pgspHashKey;
-
-typedef struct pgspEntry
-{
-	pgspHashKey key;		/* hash key of entry - MUST BE FIRST */
-	size_t		len;		/* serialized plan length */
-	dsa_pointer plan;		/* only modified holding exclusive pgsp->lock */
-	int			num_rels;	/* # of referenced base relations */
-	dsa_pointer rels;		/* only modified holding exclusive pgsp->lock */
-	int			num_const;	/* # of const values in the plan */
-	double		plantime;	/* first generic planning time */
-	Cost		generic_cost; /* total cost of the stored plan */
-	int64		discard;	/* # of time plan was discarded */
-	pg_atomic_uint32 lockers;/* prevent new plans from being saved if > 0 */
-	slock_t		mutex;		/* protects following fields only */
-	int64		bypass;		/* number of times magic happened */
-	double		usage;		/* usage factor */
-	Cost		total_custom_cost; /* total cost of custom plans planned */
-	int64		num_custom_plans; /* # of custom plans planned */
-} pgspEntry;
-
-typedef struct pgspRdependKey
-{
-	Oid			dbid;
-	Oid			relid;
-} pgspRdependKey;
-
-/*
- * Store a reverse depdendency (in pgsp_rdepend dshash), from a relation to a
- * pgsp_hash entry.
- * Note that you can't assume that the stored pgspHashKey will point to an
- * existing entry, as pgsp->lock can be released between a reverse dependency
- * creation and the pgspEntry insertion.  This should however be a transient
- * situation.
- */
-typedef struct pgspRdependEntry
-{
-	pgspRdependKey key;		/* hash key of the entry - MUST BE FIRST */
-	int			num_keys;
-	int			max_keys;
-	dsa_pointer keys;		/* Hold an array of pgspHashKey */
-} pgspRdependEntry;
 
 typedef struct pgspDsaContext
 {
@@ -154,21 +105,6 @@ typedef struct pgspSrfState
 	pgspHashKey	   *rkeys;
 } pgspSrfState;
 
-/*
- * Global shared state
- */
-typedef struct pgspSharedState
-{
-	LWLock	   *lock;			/* protects all hashtable search/modification */
-	int			LWTRANCHE_PGSP;
-	dsa_handle	pgsp_dsa_handle;
-	dshash_table_handle pgsp_rdepend_handle;
-	double		cur_median_usage;	/* current median usage in hashtable */
-	slock_t		mutex;				/* protects following fields only */
-	int64		dealloc;			/* # of times entries were deallocated */
-	TimestampTz stats_reset;		/* timestamp with all stats reset */
-} pgspSharedState;
-
 /*---- Local variables ----*/
 
 /* Saved hook values in case of unload */
@@ -177,10 +113,10 @@ static planner_hook_type prev_planner_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 
 /* Links to shared memory state */
-static pgspSharedState *pgsp = NULL;
-static HTAB *pgsp_hash = NULL;
-static dsa_area *area = NULL;
-static dshash_table *pgsp_rdepend = NULL;
+pgspSharedState *pgsp = NULL;
+HTAB *pgsp_hash = NULL;
+dsa_area *area = NULL;
+dshash_table *pgsp_rdepend = NULL;
 
 /*---- GUC variables ----*/
 
@@ -237,10 +173,6 @@ static void pgsp_attach_dsa(void);
 static void pg_shared_plans_reset_internal(Oid userid, Oid dbid, uint64 queryid);
 static void pg_shared_plans_shutdown(Datum arg);
 
-static int pgsp_rdepend_fn_compare(const void *a, const void *b, size_t size,
-								   void *arg);
-static dshash_hash pgsp_rdepend_fn_hash(const void *v, size_t size, void *arg);
-
 static void pgsp_accum_custom_plan(pgspHashKey *key, Cost cost);
 static void pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire);
 static bool pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
@@ -250,29 +182,24 @@ static bool pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats);
 static const char *pgsp_get_plan(dsa_pointer plan);
 static void pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic,
 		pgspHashKey *key, double plantime, int num_const);
-static uint32 pgsp_hash_fn(const void *key, Size keysize);
-static int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
 static Size pgsp_memsize(void);
 static pgspEntry *pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context,
 		double plantime, int num_const, Cost custom_cost, Cost generic_cost);
 static void pgsp_entry_dealloc(void);
-static bool pgsp_entry_register_rdepend(Oid dbid, Oid relid, pgspHashKey *key);
-static void pgsp_entry_unregister_rdepend(Oid dbid, Oid relid,
-										  pgspHashKey *key);
 static void pgsp_entry_remove(pgspEntry *entry);
 static bool pgsp_query_walker(Node *node, pgspWalkerContext *context);
 static int entry_cmp(const void *lhs, const void *rhs);
 static Datum do_showrels(dsa_pointer rels, int num_rels);
 static char *do_showplans(dsa_pointer plan);
 
-static dshash_parameters pgsp_rdepend_params = {
+
+dshash_parameters pgsp_rdepend_params = {
 	sizeof(pgspRdependKey),
 	sizeof(pgspRdependEntry),
 	pgsp_rdepend_fn_compare,
 	pgsp_rdepend_fn_hash,
 	-1, /* will be set at inittime */
 };
-
 
 /*
  * Module load callback
@@ -1296,33 +1223,6 @@ pg_shared_plans_shutdown(Datum arg)
 	pfree(state);
 }
 
-/* Compare two rdepend keys.  Zero means match. */
-static int
-pgsp_rdepend_fn_compare(const void *a, const void *b, size_t size,
-								   void *arg)
-{
-	pgspRdependKey *k1 = (pgspRdependKey *) a;
-	pgspRdependKey *k2 = (pgspRdependKey *) b;
-
-	if (k1->dbid == k2->dbid && k1->relid == k2->relid)
-		return 0;
-	else
-		return 1;
-}
-
-/* Calculate a hash value for a given rdepend key. */
-static dshash_hash
-pgsp_rdepend_fn_hash(const void *v, size_t size, void *arg)
-{
-	pgspRdependKey *k = (pgspRdependKey *) v;
-	uint32			h;
-
-	h = hash_combine(0, k->dbid);
-	h = hash_combine(h, k->relid);
-
-	return h;
-}
-
 /*
  * Accumulate statistics for custom planing.  Caller mustn't hold the LWLock.
  *
@@ -1681,38 +1581,6 @@ pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic, pgspHashKey *key,
 	LWLockRelease(pgsp->lock);
 }
 
-/* Calculate a hash value for a given key. */
-static uint32
-pgsp_hash_fn(const void *key, Size keysize)
-{
-	const pgspHashKey *k = (const pgspHashKey *) key;
-	uint32 h;
-
-	h = hash_combine(0, k->userid);
-	h = hash_combine(h, k->dbid);
-	h = hash_combine(h, k->queryid);
-	h = hash_combine(h, k->constid);
-
-	return h;
-}
-
-/* Compares two keys.  Zero means match. */
-static int
-pgsp_match_fn(const void *key1, const void *key2, Size keysize)
-{
-	const pgspHashKey *k1 = (const pgspHashKey *) key1;
-	const pgspHashKey *k2 = (const pgspHashKey *) key2;
-
-	if (k1->userid == k2->userid
-		&& k1->dbid == k2->dbid
-		&& k1->queryid == k2->queryid
-		&& k1->constid == k2->constid
-	)
-		return 0;
-	else
-		return 1;
-}
-
 /*
  * Estimate shared memory space needed.
  */
@@ -1876,157 +1744,6 @@ pgsp_entry_dealloc(void)
 		s->dealloc += 1;
 		SpinLockRelease(&s->mutex);
 	}
-}
-
-/*
- * Add a reverse depdency for a (dbid, relid) on the given pgspEntry,
- * identified by its key.
- */
-static bool
-pgsp_entry_register_rdepend(Oid dbid, Oid relid, pgspHashKey *key)
-{
-	pgspRdependKey rkey = {dbid, relid};
-	pgspRdependEntry   *rentry;
-	pgspHashKey			*rkeys;
-	bool				found;
-	int					i;
-
-	/* Note that even though we hold an exlusive lock on pgsp->lock, it will
-	 * eventually be released before the related entry is inserted in the main
-	 * hash table.
-	 */
-	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
-	Assert(area != NULL && pgsp_rdepend != NULL);
-
-	rentry = dshash_find_or_insert(pgsp_rdepend, &rkey, &found);
-
-	if (!found)
-	{
-		rentry->max_keys = PGSP_RDEPEND_INIT;
-		rentry->num_keys = 0;
-		rentry->keys = dsa_allocate_extended(area,
-				sizeof(pgspHashKey) * PGSP_RDEPEND_INIT,
-				DSA_ALLOC_NO_OOM);
-
-		if (rentry->keys == InvalidDsaPointer)
-		{
-			dshash_delete_entry(pgsp_rdepend, rentry);
-
-			return false;
-		}
-	}
-	Assert(rentry->keys != InvalidDsaPointer);
-
-	if (rentry->num_keys >= rentry->max_keys)
-	{
-		dsa_pointer new_rkeys_p;
-		pgspHashKey *new_rkeys;
-		int new_max_keys = Max(rentry->max_keys * 2, PGSP_RDEPEND_MAX);
-
-		/*
-		 * Too many rdepend entries for this relation, refuse to create a new
-		 * pgspEntry and raise a WARNING.
-		 * XXX should PGSP_RDEPEND_MAX be exposed as a GUC?
-		 */
-		if (rentry->num_keys >= PGSP_RDEPEND_MAX)
-		{
-			elog(WARNING, "pgsp: Too many cache entries for relation \"%s\""
-					" on database \"%s\"",
-					get_rel_name(relid), get_database_name(dbid));
-
-			dshash_release_lock(pgsp_rdepend, rentry);
-			return false;
-		}
-
-		rkeys = (pgspHashKey *) dsa_get_address(area, rentry->keys);
-		Assert(rkeys != NULL);
-
-		new_rkeys_p = dsa_allocate_extended(area,
-											sizeof(pgspHashKey) * new_max_keys,
-											DSA_ALLOC_NO_OOM);
-		if (new_rkeys_p == InvalidDsaPointer)
-		{
-			elog(WARNING, "pgsp: Could not cache entries for relation \"%s\""
-					" on database \"%s\": out of shared memory",
-					get_rel_name(relid), get_database_name(dbid));
-
-			dshash_release_lock(pgsp_rdepend, rentry);
-			return false;
-		}
-
-		new_rkeys = (pgspHashKey *) dsa_get_address(area, new_rkeys_p);
-		Assert(new_rkeys != NULL);
-
-		memcpy(new_rkeys, rkeys, sizeof(pgspHashKey) * new_max_keys);
-		rkeys = NULL;
-		dsa_free(area, rentry->keys);
-
-		rentry->keys = new_rkeys_p;
-		rentry->max_keys = new_max_keys;
-	}
-
-	rkeys = (pgspHashKey *) dsa_get_address(area, rentry->keys);
-	Assert(rkeys != NULL);
-
-	/* Check first if the rdepend is already registered */
-	found = false;
-	for (i = 0; i < rentry->num_keys; i++)
-	{
-		if (pgsp_match_fn(key, &(rkeys[i]), 0) == 0)
-		{
-			found = true;
-			break;
-		}
-	}
-
-	if (!found)
-		rkeys[rentry->num_keys++] = *key;
-
-	dshash_release_lock(pgsp_rdepend, rentry);
-
-	return true;
-}
-
-/*
- * Remove a reverse dependency for a (dbid, relid) on the given pgspEntry,
- * indentified by its key.
- */
-static void
-pgsp_entry_unregister_rdepend(Oid dbid, Oid relid, pgspHashKey *key)
-{
-	pgspRdependEntry   *rentry;
-	pgspHashKey			*rkeys;
-	pgspRdependKey		rkey = {dbid, relid};
-	int					delidx;
-
-	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
-	Assert(area != NULL);
-
-	rentry = dshash_find(pgsp_rdepend, &rkey, true);
-
-	if(!rentry)
-		return;
-
-	Assert(rentry->keys != InvalidDsaPointer);
-
-	rkeys = (pgspHashKey *) dsa_get_address(area, rentry->keys);
-	for(delidx = 0; delidx < rentry->num_keys; delidx++)
-	{
-		if (pgsp_match_fn(key, &(rkeys[delidx]), 0) == 0)
-		{
-			int pos;
-
-			for (pos = delidx + 1; pos < rentry->num_keys; pos++)
-				rkeys[pos - 1] = rkeys[pos];
-
-			rentry->num_keys--;
-
-			/* We should not register duplicated rdpend entries. */
-			break;
-		}
-	}
-
-	dshash_release_lock(pgsp_rdepend, rentry);
 }
 
 /* Remove an entry from the hash table and free associated dsa pointers. */
