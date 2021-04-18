@@ -9,7 +9,8 @@ PG_CONFIG ?= pg_config
 
 MODULE_big = pg_shared_plans
 
-OBJS = pg_shared_plans.o pgsp_import.o pgsp_inherit.o pgsp_rdepend.o
+OBJS = pg_shared_plans.o pgsp_import.o pgsp_inherit.o pgsp_rdepend.o \
+	pgsp_utility.o
 
 all:
 

@@ -16,6 +16,9 @@
 #include "postgres.h"
 
 #include "datatype/timestamp.h"
+#include "lib/dshash.h"
+#include "miscadmin.h"
+#include "storage/s_lock.h"
 #include "utils/hsearch.h"
 
 
@@ -46,6 +49,14 @@ typedef struct pgspEntry
 	int64		num_custom_plans; /* # of custom plans planned */
 } pgspEntry;
 
+typedef enum pgspEvictionKind
+{
+	PGSP_UNLOCK,
+	PGSP_DISCARD,
+	PGSP_DISCARD_AND_LOCK,
+	PGSP_EVICT
+} pgspEvictionKind;
+
 /*
  * Global shared state
  */
@@ -66,5 +77,10 @@ extern pgspSharedState *pgsp;
 extern HTAB *pgsp_hash;
 extern dsa_area *area;
 extern dshash_table *pgsp_rdepend;
+
+uint32 pgsp_hash_fn(const void *key, Size keysize);
+int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
+
+void pgsp_evict_by_oid(Oid dbid, Oid classid, Oid oid, pgspEvictionKind kind);
 
 #endif

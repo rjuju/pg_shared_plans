@@ -14,17 +14,12 @@
 #include "postgres.h"
 
 #include "access/relation.h"
-#include "access/xact.h"
 #include "catalog/index.h"
-#include "catalog/namespace.h"
-#include "catalog/partition.h"
-#include "catalog/pg_inherits.h"
 #if PG_VERSION_NUM < 130000
 #include "catalog/pg_type_d.h"
 #endif
 #include "commands/dbcommands.h"
 #include "commands/explain.h"
-#include "commands/tablecmds.h"
 #if PG_VERSION_NUM >= 130000
 #include "common/hashfn.h"
 #else
@@ -54,15 +49,15 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #if PG_VERSION_NUM < 140000
 #include "utils/timestamp.h"
 #endif
 
 #include "include/pg_shared_plans.h"
 #include "include/pgsp_import.h"
-#include "include/pgsp_inherit.h"
 #include "include/pgsp_rdepend.h"
+#include "include/pgsp_utility.h"
 
 PG_MODULE_MAGIC;
 
@@ -73,14 +68,6 @@ PG_MODULE_MAGIC;
 #define USAGE_DEALLOC_PERCENT	5		/* free this % of entries at once */
 
 #define PLANCACHE_THRESHOLD		5
-
-typedef enum pgspEvictionKind
-{
-	PGSP_UNLOCK,
-	PGSP_DISCARD,
-	PGSP_DISCARD_AND_LOCK,
-	PGSP_EVICT
-} pgspEvictionKind;
 
 
 typedef struct pgspDsaContext
@@ -177,7 +164,6 @@ static void pgsp_accum_custom_plan(pgspHashKey *key, Cost cost);
 static void pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire);
 static bool pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
 							   pgspHashKey *key);
-static void pgsp_evict_by_relid(Oid dbid, Oid relid, pgspEvictionKind kind);
 static bool pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats);
 static const char *pgsp_get_plan(dsa_pointer plan);
 static void pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic,
@@ -682,209 +668,23 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 					)
 {
 	Node   *parsetree = pstmt->utilityStmt;
-	List   *oids_discard = NIL,
-		   *oids_remove = NIL,
-		   *oids_lock = NIL;
-	bool	reset_current_db = false;
+	pgspUtilityContext util;
 
 	/* Create or attach to the dsa. */
 	pgsp_attach_dsa();
 
-	if (IsA(parsetree, DropStmt))
-	{
-		DropStmt *drop = (DropStmt *) parsetree;
-		List     *objs_remove = NIL;
-		ListCell *cell;
+	memset(&util, 0, sizeof(pgspUtilityContext));
 
-		switch (drop->removeType)
-		{
-			/* For indexes we need to get the underlying table instead. */
-			case OBJECT_INDEX:
-			{
-				/*
-				 * Don't mess  up with the transactions if the command is gonna
-				 * fail.
-				 */
-				if (drop->concurrent &&
-					(GetTopTransactionIdIfAny() != InvalidTransactionId ||
-					 IsTransactionBlock())
-				)
-					goto run_utility;
-
-				foreach(cell, drop->objects)
-				{
-					List *name = (List *) lfirst(cell);
-					RangeVar *rel = makeRangeVarFromNameList(name);
-					Oid			indoid, heapoid;
-
-					/*
-					 * XXX: is it really ok to ignore permissions here, as
-					 * standard_ProcessUtility will fail before we actually use
-					 * the generated list?
-					 */
-					indoid = RangeVarGetRelidExtended(rel, AccessExclusiveLock,
-							RVR_MISSING_OK, NULL, NULL);
-					if (!OidIsValid(indoid))
-						break; /* XXX can that happen? */
-
-					heapoid = IndexGetRelation(indoid, true);
-					if (!OidIsValid(heapoid))
-						break; /* XXX can that happen? */
-
-					/*
-					 * Got the root table, directly add its oid to the discard
-					 * list.  We assume that a generic plan will still be a
-					 * good idea after the index is removed.
-					 */
-					if (drop->concurrent)
-						oids_lock = list_append_unique_oid(oids_lock, heapoid);
-					else
-						oids_discard = list_append_unique_oid(oids_discard,
-															  heapoid);
-
-					/*
-					 * CIC expects to be the first command in a transaction, so
-					 * commit the transaction that we just started when looking
-					 * for the root table name and start a fresh one.
-					 */
-					if (drop->concurrent)
-					{
-						MemoryContext	oldcontext = CurrentMemoryContext;
-
-						PopActiveSnapshot();
-						CommitTransactionCommand();
-						StartTransactionCommand();
-						MemoryContextSwitchTo(oldcontext);
-						PushActiveSnapshot(GetTransactionSnapshot());
-					}
-				}
-				break;
-			}
-			case OBJECT_FOREIGN_TABLE:
-			case OBJECT_MATVIEW:
-			case OBJECT_TABLE:
-			case OBJECT_VIEW:
-				/* Handled types. */
-				objs_remove = drop->objects;
-				break;
-			default:
-				/* nothing to do. */
-				break;
-		}
-
-		foreach(cell, objs_remove)
-		{
-			RangeVar   *rel = makeRangeVarFromNameList((List *) lfirst(cell));
-			Oid         oid;
-
-			oid = RangeVarGetRelidExtended(rel, AccessShareLock,
-					RVR_MISSING_OK, NULL, NULL);
-
-			if (OidIsValid(oid))
-				oids_remove = list_append_unique_oid(oids_remove, oid);
-		}
-	}
-	else if (IsA(parsetree, AlterTableStmt))
-	{
-		AlterTableStmt *atstmt = (AlterTableStmt *) parsetree;
-		LOCKMODE lockmode;
-		ListCell *lc;
-
-		lockmode = AlterTableGetLockLevel(atstmt->cmds);
-
-		foreach(lc, atstmt->cmds)
-		{
-			AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
-
-			if (cmd->subtype == AT_DetachPartition
-					&& ((PartitionCmd *)cmd->def)->concurrent
-			)
-			{
-				Oid oid;
-
-				/* Ignore if the command is gonna fail. */
-				if (IsTransactionBlock())
-					goto run_utility;
-
-				oid = AlterTableLookupRelation(atstmt, lockmode);
-
-				if (OidIsValid(oid))
-				{
-					/*
-					 * For attaching a partition, we only need to discard plans
-					 * depending on the referenced partitioned table and its
-					 * ancestors.
-					 */
-					oids_lock = list_append_unique_oid(oids_lock, oid);
-					oids_lock = list_concat_unique_oid(oids_lock,
-							get_partition_ancestors(oid));
-				}
-			}
-		}
-	}
-	else if (IsA(parsetree, AlterTSDictionaryStmt))
-	{
-		/* We have no way to track dependencies on TEXT SEARCH DICTIONNARY, so
-		 * the only way to avoid returning false result is to entirely drop the
-		 * cache for the current database.  Hopefully such commands should not
-		 * be frequent so it won't be a big issue.
-		 * Note that to properly test this behavior you need multiple backends
-		 * as the one executing the ALTER TEXT SEARCH DICTIONNARY wilL discard
-		 * his own cache.
-		 * Note also that to ensure a correct behavior we have to make sure
-		 * that the command isn't run in a transaction (done here), and we will
-		 * only drop the cached plans after the UTILITY has been executed.
-		 * XXX It's still possible that someone locally deactivate
-		 *     pg_shared_plans before executing such a command, which would be
-		 *     bad, or that another backend cache a new plan between the reset
-		 *     and the commit of the ALTER TEXT SELECT DICTIONARY.
-		*/
-		if(IsTransactionBlock())
-			elog(ERROR, "pg_shared_plans: can't run ALTER TEXT SEARCH"
-					" DICTIONNARY in a transaction.");
-		reset_current_db = true;
-	}
-
-	/* For UTILITY with CONCURRENTLY option, the altered object property will
-	 * be changed in the middle of the execution, with no AEL kept long enough
-	 * to protect our cache.  So the best we can do since we can't hook on the
-	 * catalog invalidation infrastructure is to
-	 *  - discard the cache now
-	 *  - lock the dependent entries to prevent any new plan to be saved
-	 *  - downgrade the lock on pgsp->lock while the entries are lock
-	 *  - hold that shared lock until after standard_ProcessUtility execution
-	 *    and hope this backend won't be killed while the entries are locked,
-	 *    otherwise they would be locked until they get evicted, either
-	 *    automatically or manually.
+	/*
+	 * Process all nodes that have to be processed before the UTILITY
+	 * execution, mostly DROP commands.
 	 */
-	if (oids_lock)
-	{
-		ListCell *lc;
+	pgsp_utility_pre_exec(parsetree, &util);
 
-		Assert(oids_discard == NIL && oids_remove == NULL);
+	/* Process the populated util.oids_lock if any. */
+	pgsp_utility_do_lock(&util);
 
-		LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
-
-		foreach(lc, oids_lock)
-			pgsp_evict_by_relid(MyDatabaseId, lfirst_oid(lc),
-								PGSP_DISCARD_AND_LOCK);
-
-		/*
-		 * Downgrade the lock.  We locked all the underlying entries so there's
-		 * no risk of having another backend caching a new plan before the
-		 * index is really dropped.  There's however a risk that the entry
-		 * gets evicted and recreated before acquiring the shared lock on
-		 * pgsp->lock, leaving the new entry indefinitely locked.
-		 */
-		LWLockRelease(pgsp->lock);
-		LWLockAcquire(pgsp->lock, LW_SHARED);
-
-		foreach(lc, oids_lock)
-			pgsp_evict_by_relid(MyDatabaseId, lfirst_oid(lc), PGSP_UNLOCK);
-	}
-
-run_utility:
-
+	/* Run the utility. */
 	if (prev_ProcessUtility)
 		prev_ProcessUtility(pstmt, queryString,
 				context, params, queryEnv,
@@ -906,10 +706,10 @@ run_utility:
 #endif
 				);
 
-	if (reset_current_db)
+	if (util.reset_current_db)
 	{
 		Assert(IsA(parsetree, AlterTSDictionaryStmt));
-		Assert(oids_discard == NIL && oids_remove == NIL && oids_lock == NIL);
+		Assert(!util.has_discard && !util.has_remove && !util.has_lock);
 
 		pg_shared_plans_reset_internal(InvalidOid, MyDatabaseId,
 				UINT64CONST (0));
@@ -917,159 +717,40 @@ run_utility:
 		return;
 	}
 
-	Assert(!reset_current_db);
-
-	if (IsA(parsetree, AlterTableStmt))
-	{
-		AlterTableStmt *atstmt = (AlterTableStmt *) parsetree;
-		LOCKMODE    lockmode;
-
-		/*
-		 * Any change that requires an AccessExclusiveLock should impact the
-		 * plan.  We assume that it's better to discard the plans only, hoping
-		 * that there will be more entries which will still be valid after the
-		 * ALTER TABLE.
-		 * Attaching / detaching partitions also requires cache invalidation.
-		 * Note that CONCURRENT detaching is handled before the UTILITY
-		 * execution due to its non-transactional nature.
-		 */
-		lockmode = AlterTableGetLockLevel(atstmt->cmds);
-		if (lockmode >= AccessExclusiveLock)
-		{
-			Oid		oid = AlterTableLookupRelation(atstmt, lockmode);
-			List   *inhs;
-
-			if (OidIsValid(oid))
-			{
-				oids_discard = lappend_oid(oids_discard, oid);
-
-				/*
-				 * We must also discard any plans depending on ancestors, if
-				 * any.
-				 */
-				inhs = pgsp_get_inheritance_ancestors(oid);
-				if (inhs != NIL)
-					oids_discard = list_concat_unique_oid(oids_discard, inhs);
-
-				/* And inheritors, if it's not a DETACH PARTITION. */
-				if (list_length(atstmt->cmds) == 1 &&
-						((AlterTableCmd *) linitial(atstmt->cmds))->subtype !=
-						AT_DetachPartition)
-				{
-					inhs = find_all_inheritors(oid, AccessShareLock, NULL);
-					if (inhs != NIL)
-						oids_discard = list_concat_unique_oid(oids_discard,
-								inhs);
-				}
-			}
-		}
-		else
-		{
-			ListCell *lc;
-
-			foreach(lc, atstmt->cmds)
-			{
-				AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
-
-				if (cmd->subtype == AT_AttachPartition ||
-					cmd->subtype == AT_DetachPartitionFinalize ||
-					(cmd->subtype == AT_DetachPartition
-						&& !((PartitionCmd *)cmd->def)->concurrent)
-				)
-				{
-					Oid oid = AlterTableLookupRelation(atstmt, lockmode);
-
-					/* This should require an exclusive lock. */
-					Assert(cmd->subtype != AT_DetachPartition);
-
-					if (OidIsValid(oid))
-					{
-						/*
-						 * For attaching/detaching a partition, we only need to
-						 * discard plans depending on the referenced
-						 * partitioned table and its ancestors.
-						 */
-						oids_discard = list_append_unique_oid(oids_discard, oid);
-						oids_discard = list_concat_unique_oid(oids_discard,
-								get_partition_ancestors(oid));
-					}
-				}
-			}
-		}
-	}
-	else if (IsA(parsetree, IndexStmt))
-	{
-		IndexStmt  *stmt = (IndexStmt *) parsetree;
-		Oid			relid;
-		List	   *inhs;
-
-		relid = RangeVarGetRelidExtended(stmt->relation, AccessExclusiveLock,
-				RVR_MISSING_OK, NULL, NULL);
-
-		Assert(OidIsValid(relid));
-		oids_discard = list_append_unique_oid(oids_discard, relid);
-
-		/* We need to discard cache for all ancestors */
-		inhs = pgsp_get_inheritance_ancestors(relid);
-		if (inhs != NIL)
-			oids_discard = list_concat_unique_oid(oids_discard, inhs);
-
-		/* And also for all inheritors if it's a partitioned table. */
-		if (get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE)
-		{
-			inhs = find_all_inheritors(relid, AccessShareLock, NULL);
-			if (inhs != NIL)
-				oids_discard = list_concat_unique_oid(oids_discard, inhs);
-		}
-	}
-	else if (IsA(parsetree, CreateStmt))
-	{
-		CreateStmt *stmt = (CreateStmt *) parsetree;
-		ListCell   *lc;
-
-		/*
-		 * If it's an inheritance children, discard all caches depending on any
-		 * of the ancestors.
-		 */
-		foreach(lc, stmt->inhRelations)
-		{
-			RangeVar   *rv = (RangeVar *) lfirst(lc);
-			Oid			oid;
-
-			oid = RangeVarGetRelidExtended(rv, AccessShareLock, RVR_MISSING_OK,
-					NULL, NULL);
-			Assert(OidIsValid(oid));
-			oids_discard = list_append_unique_oid(oids_discard, oid);
-
-			if (stmt->ofTypename)
-				oids_discard = list_concat_unique_oid(oids_discard,
-						get_partition_ancestors(oid));
-			else
-				oids_discard = list_concat_unique_oid(oids_discard,
-						pgsp_get_inheritance_ancestors(oid));
-		}
-	}
+	/*
+	 * Now that the command completed, process the rest of the nodes that
+	 * weren't processed before the execution.
+	 */
+	pgsp_utility_post_exec(parsetree, &util);
 
 	/*
-	 * Now that the command completed, discard any saved plan, or drop the
-	 * entry referencing the underlying relation, or unlock the required
-	 * entries depending on the original UTILITY.
+	 * Discard any saved plan, or drop the entry referencing the underlying
+	 * relation, or unlock the required entries depending on the original
+	 * UTILITY.
 	 */
-	if (oids_discard != NIL || oids_remove != NIL || oids_lock != NIL)
+	if (util.has_discard || util.has_remove || util.has_lock)
 	{
-		ListCell *lc;
+		pgspOidsEntry  *entry;
+		HASH_SEQ_STATUS oids_seq;
+		ListCell	   *lc;
 
-		if (oids_lock != NIL)
-			Assert(oids_discard == NULL && oids_remove == NULL);
+		if (util.has_lock)
+			Assert(!util.has_discard && !util.has_remove);
 		else
 			LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
 
-		foreach(lc, oids_discard)
-			pgsp_evict_by_relid(MyDatabaseId, lfirst_oid(lc), PGSP_DISCARD);
+		hash_seq_init(&oids_seq, util.oids_hash);
+		while ((entry = hash_seq_search(&oids_seq)) != NULL)
+		{
+			if (entry->key.kind != PGSP_DISCARD &&
+				entry->key.kind != PGSP_EVICT)
+				continue;
 
-		foreach(lc, oids_remove)
-			pgsp_evict_by_relid(MyDatabaseId, lfirst_oid(lc), PGSP_EVICT);
-
+			foreach(lc, entry->oids)
+				pgsp_evict_by_oid(MyDatabaseId, entry->key.classid,
+								  lfirst_oid(lc),
+								  entry->key.kind);
+		}
 		/*
 		 * Also make sure that we don't cache a new plan as we don't know if
 		 * the transaction will commit or not.
@@ -1383,7 +1064,8 @@ pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
 	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
 	for (i = 0; i < context->num_rels; i++)
 	{
-		ok = pgsp_entry_register_rdepend(MyDatabaseId, array[i], key);
+		ok = pgsp_entry_register_rdepend(MyDatabaseId, RELOID, array[i],
+										 key);
 
 		if (!ok)
 			break;
@@ -1403,7 +1085,7 @@ pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
 		Assert(array != NULL);
 		/* Free all saved rdepend. */
 		for (i = 0; i < last_alloced; i++)
-			pgsp_entry_unregister_rdepend(MyDatabaseId, array[i], key);
+			pgsp_entry_unregister_rdepend(MyDatabaseId, RELOID, array[i], key);
 
 		/* And free the array of Oid. */
 		dsa_free(area, context->rels);
@@ -1417,10 +1099,10 @@ pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
  * Handle cache eviction.  If dropEntry is false, only discard the plan,
  * otherwise also remove the pgspEntry from pgsp_hash.
  */
-static void
-pgsp_evict_by_relid(Oid dbid, Oid relid, pgspEvictionKind kind)
+void
+pgsp_evict_by_oid(Oid dbid, Oid classid, Oid relid, pgspEvictionKind kind)
 {
-	pgspRdependKey		rkey = {dbid, relid};
+	pgspRdependKey		rkey = {dbid, classid, relid};
 	pgspRdependEntry   *rentry;
 	pgspHashKey		   *rkeys;
 	int					i;
@@ -1581,6 +1263,38 @@ pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic, pgspHashKey *key,
 	LWLockRelease(pgsp->lock);
 }
 
+/* Calculate a hash value for a given key. */
+uint32
+pgsp_hash_fn(const void *key, Size keysize)
+{
+	const pgspHashKey *k = (const pgspHashKey *) key;
+	uint32 h;
+
+	h = hash_combine(0, k->userid);
+	h = hash_combine(h, k->dbid);
+	h = hash_combine(h, k->queryid);
+	h = hash_combine(h, k->constid);
+
+	return h;
+}
+
+/* Compares two keys.  Zero means match. */
+int
+pgsp_match_fn(const void *key1, const void *key2, Size keysize)
+{
+	const pgspHashKey *k1 = (const pgspHashKey *) key1;
+	const pgspHashKey *k2 = (const pgspHashKey *) key2;
+
+	if (k1->userid == k2->userid
+		&& k1->dbid == k2->dbid
+		&& k1->queryid == k2->queryid
+		&& k1->constid == k2->constid
+	)
+		return 0;
+	else
+		return 1;
+}
+
 /*
  * Estimate shared memory space needed.
  */
@@ -1662,7 +1376,8 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 
 			/* Free all saved rdepend. */
 			for (i = 0; i < context->num_rels; i++)
-				pgsp_entry_unregister_rdepend(MyDatabaseId, array[i], key);
+				pgsp_entry_unregister_rdepend(MyDatabaseId, RELOID, array[i],
+											  key);
 
 			/* And free the array of Oid. */
 			dsa_free(area, context->rels);
@@ -1766,8 +1481,8 @@ pgsp_entry_remove(pgspEntry *entry)
 		array = (Oid *) dsa_get_address(area, entry->rels);
 
 		for(i = 0; i < entry->num_rels; i++)
-			pgsp_entry_unregister_rdepend(entry->key.dbid, array[i],
-										  &entry->key);
+			pgsp_entry_unregister_rdepend(entry->key.dbid, RELOID,
+										  array[i], &entry->key);
 		dsa_free(area, entry->rels);
 	}
 
@@ -2146,7 +1861,7 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 
 		if(OidIsValid(relid))
 		{
-			pgspRdependKey rkey = {dbid, relid};
+			pgspRdependKey rkey = {dbid, RELOID, relid};
 			pgspRdependEntry *rentry;
 			pgspHashKey		 *rkeys;
 			size_t				size;

@@ -13,6 +13,7 @@
 
 #include "postgres.h"
 
+#include "catalog/pg_class_d.h"
 #include "commands/dbcommands.h"
 #include "storage/lwlock.h"
 #if PG_VERSION_NUM >= 130000
@@ -21,17 +22,21 @@
 #include "utils/hashutils.h"
 #endif
 #include "utils/lsyscache.h"
+#include "utils/syscache.h"
 
 #include "include/pgsp_rdepend.h"
 
+static void pgsp_get_rdep_name(Oid classid, Oid oid, char **deptype,
+		char **depname);
+
 /*
- * Add a reverse depdency for a (dbid, relid) on the given pgspEntry,
+ * Add a reverse depdency for a (dbid, classid, oid) on the given pgspEntry,
  * identified by its key.
  */
 bool
-pgsp_entry_register_rdepend(Oid dbid, Oid relid, pgspHashKey *key)
+pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 {
-	pgspRdependKey rkey = {dbid, relid};
+	pgspRdependKey rkey = {dbid, classid, oid};
 	pgspRdependEntry   *rentry;
 	pgspHashKey			*rkeys;
 	bool				found;
@@ -43,6 +48,9 @@ pgsp_entry_register_rdepend(Oid dbid, Oid relid, pgspHashKey *key)
 	 */
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
 	Assert(area != NULL && pgsp_rdepend != NULL);
+
+	if (classid != RELOID)
+		elog(ERROR, "pgsp: rdepend classid %d not handled", classid);
 
 	rentry = dshash_find_or_insert(pgsp_rdepend, &rkey, &found);
 
@@ -70,15 +78,20 @@ pgsp_entry_register_rdepend(Oid dbid, Oid relid, pgspHashKey *key)
 		int new_max_keys = Max(rentry->max_keys * 2, PGSP_RDEPEND_MAX);
 
 		/*
-		 * Too many rdepend entries for this relation, refuse to create a new
+		 * Too many rdepend entries for this object, refuse to create a new
 		 * pgspEntry and raise a WARNING.
 		 * XXX should PGSP_RDEPEND_MAX be exposed as a GUC?
 		 */
 		if (rentry->num_keys >= PGSP_RDEPEND_MAX)
 		{
-			elog(WARNING, "pgsp: Too many cache entries for relation \"%s\""
+			char *deptype;
+			char *depname;
+
+			pgsp_get_rdep_name(classid, oid, &deptype, &depname);
+
+			elog(WARNING, "pgsp: Too many cache entries for %s \"%s\""
 					" on database \"%s\"",
-					get_rel_name(relid), get_database_name(dbid));
+					deptype, depname, get_database_name(dbid));
 
 			dshash_release_lock(pgsp_rdepend, rentry);
 			return false;
@@ -92,9 +105,14 @@ pgsp_entry_register_rdepend(Oid dbid, Oid relid, pgspHashKey *key)
 											DSA_ALLOC_NO_OOM);
 		if (new_rkeys_p == InvalidDsaPointer)
 		{
-			elog(WARNING, "pgsp: Could not cache entries for relation \"%s\""
+			char *deptype;
+			char *depname;
+
+			pgsp_get_rdep_name(classid, oid, &deptype, &depname);
+
+			elog(WARNING, "pgsp: Could not cache entries for %s \"%s\""
 					" on database \"%s\": out of shared memory",
-					get_rel_name(relid), get_database_name(dbid));
+					deptype, depname, get_database_name(dbid));
 
 			dshash_release_lock(pgsp_rdepend, rentry);
 			return false;
@@ -134,19 +152,22 @@ pgsp_entry_register_rdepend(Oid dbid, Oid relid, pgspHashKey *key)
 }
 
 /*
- * Remove a reverse dependency for a (dbid, relid) on the given pgspEntry,
+ * Remove a reverse dependency for a (dbid, classid, oid) on the given pgspEntry,
  * indentified by its key.
  */
 void
-pgsp_entry_unregister_rdepend(Oid dbid, Oid relid, pgspHashKey *key)
+pgsp_entry_unregister_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 {
 	pgspRdependEntry   *rentry;
 	pgspHashKey			*rkeys;
-	pgspRdependKey		rkey = {dbid, relid};
+	pgspRdependKey		rkey = {dbid, classid, oid};
 	int					delidx;
 
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
 	Assert(area != NULL);
+
+	if (classid != RELOID)
+		elog(ERROR, "pgsp: rdepend classid %d not handled", classid);
 
 	rentry = dshash_find(pgsp_rdepend, &rkey, true);
 
@@ -175,36 +196,19 @@ pgsp_entry_unregister_rdepend(Oid dbid, Oid relid, pgspHashKey *key)
 	dshash_release_lock(pgsp_rdepend, rentry);
 }
 
-/* Calculate a hash value for a given key. */
-uint32
-pgsp_hash_fn(const void *key, Size keysize)
+static void
+pgsp_get_rdep_name(Oid classid, Oid oid, char **deptype, char **depname)
 {
-	const pgspHashKey *k = (const pgspHashKey *) key;
-	uint32 h;
-
-	h = hash_combine(0, k->userid);
-	h = hash_combine(h, k->dbid);
-	h = hash_combine(h, k->queryid);
-	h = hash_combine(h, k->constid);
-
-	return h;
-}
-
-/* Compares two keys.  Zero means match. */
-int
-pgsp_match_fn(const void *key1, const void *key2, Size keysize)
-{
-	const pgspHashKey *k1 = (const pgspHashKey *) key1;
-	const pgspHashKey *k2 = (const pgspHashKey *) key2;
-
-	if (k1->userid == k2->userid
-		&& k1->dbid == k2->dbid
-		&& k1->queryid == k2->queryid
-		&& k1->constid == k2->constid
-	)
-		return 0;
+	if (classid == RELOID)
+	{
+		*depname = get_rel_name(oid);
+		*deptype = "relation";
+	}
 	else
-		return 1;
+	{
+		/* Should not happen. */
+		elog(ERROR, "pgsp: rdepend classid %d not handled", classid);
+	}
 }
 
 /* Compare two rdepend keys.  Zero means match. */
@@ -215,7 +219,7 @@ pgsp_rdepend_fn_compare(const void *a, const void *b, size_t size,
 	pgspRdependKey *k1 = (pgspRdependKey *) a;
 	pgspRdependKey *k2 = (pgspRdependKey *) b;
 
-	if (k1->dbid == k2->dbid && k1->relid == k2->relid)
+	if (k1->dbid == k2->dbid && k1->classid == k2->classid && k1->oid == k2->oid)
 		return 0;
 	else
 		return 1;
@@ -229,7 +233,8 @@ pgsp_rdepend_fn_hash(const void *v, size_t size, void *arg)
 	uint32			h;
 
 	h = hash_combine(0, k->dbid);
-	h = hash_combine(h, k->relid);
+	h = hash_combine(h, k->classid);
+	h = hash_combine(h, k->oid);
 
 	return h;
 }

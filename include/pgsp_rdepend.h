@@ -29,7 +29,8 @@
 typedef struct pgspRdependKey
 {
 	Oid			dbid;
-	Oid			relid;
+	Oid			classid;
+	Oid			oid;
 } pgspRdependKey;
 
 /*
@@ -50,10 +51,8 @@ typedef struct pgspRdependEntry
 
 extern dshash_parameters pgsp_rdepend_params;
 
-bool pgsp_entry_register_rdepend(Oid dbid, Oid relid, pgspHashKey *key);
-void pgsp_entry_unregister_rdepend(Oid dbid, Oid relid, pgspHashKey *key);
-uint32 pgsp_hash_fn(const void *key, Size keysize);
-int pgsp_match_fn(const void *key1, const void *key2, Size keysize);
+bool pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key);
+void pgsp_entry_unregister_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key);
 
 int pgsp_rdepend_fn_compare(const void *a, const void *b, size_t size,
 								   void *arg);
