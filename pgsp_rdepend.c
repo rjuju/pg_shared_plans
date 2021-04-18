@@ -14,6 +14,7 @@
 #include "postgres.h"
 
 #include "catalog/pg_class_d.h"
+#include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "storage/lwlock.h"
 #if PG_VERSION_NUM >= 130000
@@ -21,6 +22,7 @@
 #else
 #include "utils/hashutils.h"
 #endif
+#include "tcop/utility.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -49,7 +51,7 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
 	Assert(area != NULL && pgsp_rdepend != NULL);
 
-	if (classid != RELOID)
+	if (classid != RELOID && classid != TYPEOID)
 		elog(ERROR, "pgsp: rdepend classid %d not handled", classid);
 
 	rentry = dshash_find_or_insert(pgsp_rdepend, &rkey, &found);
@@ -166,7 +168,7 @@ pgsp_entry_unregister_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
 	Assert(area != NULL);
 
-	if (classid != RELOID)
+	if (classid != RELOID && classid != TYPEOID)
 		elog(ERROR, "pgsp: rdepend classid %d not handled", classid);
 
 	rentry = dshash_find(pgsp_rdepend, &rkey, true);
@@ -203,6 +205,21 @@ pgsp_get_rdep_name(Oid classid, Oid oid, char **deptype, char **depname)
 	{
 		*depname = get_rel_name(oid);
 		*deptype = "relation";
+	}
+	else if (classid == TYPEOID)
+	{
+		HeapTuple tp;
+
+		tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(oid));
+		if (HeapTupleIsValid(tp))
+		{
+			Form_pg_type typtup = (Form_pg_type) GETSTRUCT(tp);
+			*depname = pstrdup(typtup->typname.data);
+			ReleaseSysCache(tp);
+		}
+		else
+			*depname = "<null>";
+		*deptype = "type";
 	}
 	else
 	{

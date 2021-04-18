@@ -991,8 +991,10 @@ pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
 	List	   *oids = NIL;
 	Oid		   *array = NULL;
 	ListCell   *lc;
-	bool		ok;
+	bool		ok = true;
 	int			i;
+	int			nb_alloced_rels = 0;
+	int			nb_alloced_typ = 0;
 
 	Assert(!LWLockHeldByMe(pgsp->lock));
 	Assert(context->plan == InvalidDsaPointer);
@@ -1058,38 +1060,83 @@ pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
 		Assert(i == list_length(oids));
 	}
 
-	ok = true;
+	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
 
 	/* Save the list of relation dependencies */
-	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
 	for (i = 0; i < context->num_rels; i++)
 	{
 		ok = pgsp_entry_register_rdepend(MyDatabaseId, RELOID, array[i],
 										 key);
 
 		if (!ok)
-			break;
+		{
+			nb_alloced_rels = i;
+			goto free_rels;
+		}
 	}
 
+	/* Also save TYPEOID dependency. */
+	i = 0;
+	foreach(lc, stmt->invalItems)
+	{
+		PlanInvalItem *item = (PlanInvalItem *) lfirst(lc);
+
+		if (item->cacheId != TYPEOID)
+			continue;
+
+		ok = pgsp_entry_register_rdepend(MyDatabaseId, item->cacheId,
+										 item->hashValue, key);
+		if (!ok)
+		{
+			nb_alloced_typ = i;
+			goto free_plans;
+		}
+		i++;
+	}
+
+free_plans:
+	/*
+	 * If we couldn't register a type dependency, free all previously
+	 * allocated shared memory.
+	 */
+	if (!ok && nb_alloced_typ > 0)
+	{
+		i = 0;
+		foreach(lc, stmt->invalItems)
+		{
+			PlanInvalItem *item = (PlanInvalItem *) lfirst(lc);
+
+			if (item->cacheId != TYPEOID)
+				continue;
+
+			pgsp_entry_unregister_rdepend(MyDatabaseId, item->cacheId,
+										  item->hashValue, key);
+
+			i++;
+			if (i > nb_alloced_typ)
+				break;
+		}
+	}
+
+free_rels:
 	/*
 	 * If we couldn't register a relation dependency, free all previously
 	 * allocated shared memory.
 	 */
-	if (!ok)
+	if (!ok && nb_alloced_rels > 0)
 	{
-		int last_alloced = i;
-
 		/* Free the plan. */
 		dsa_free(area, context->plan);
 
 		Assert(array != NULL);
 		/* Free all saved rdepend. */
-		for (i = 0; i < last_alloced; i++)
+		for (i = 0; i < nb_alloced_rels; i++)
 			pgsp_entry_unregister_rdepend(MyDatabaseId, RELOID, array[i], key);
 
 		/* And free the array of Oid. */
 		dsa_free(area, context->rels);
 	}
+
 	LWLockRelease(pgsp->lock);
 
 	return ok;
