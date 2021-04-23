@@ -747,9 +747,11 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				continue;
 
 			foreach(lc, entry->oids)
+			{
 				pgsp_evict_by_oid(MyDatabaseId, entry->key.classid,
 								  lfirst_oid(lc),
 								  entry->key.kind);
+			}
 		}
 		/*
 		 * Also make sure that we don't cache a new plan as we don't know if
@@ -1192,18 +1194,18 @@ pgsp_evict_by_oid(Oid dbid, Oid classid, Oid relid, pgspEvictionKind kind)
 			Assert(pg_atomic_read_u32(&entry->lockers) > 0);
 		}
 
-		if (entry->plan == InvalidDsaPointer)
-			continue;
-
 		if (kind != PGSP_UNLOCK)
 		{
 			Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
 
-			dsa_free(area, entry->plan);
-			entry->plan = InvalidDsaPointer;
-
-			if (kind != PGSP_EVICT)
-				entry->discard++;
+			/* We only report a discard of a plan that was previously valid. */
+			if (entry->plan != InvalidDsaPointer)
+			{
+				dsa_free(area, entry->plan);
+				entry->plan = InvalidDsaPointer;
+				if (kind != PGSP_EVICT)
+					entry->discard++;
+			}
 
 			if(kind == PGSP_EVICT)
 				hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
