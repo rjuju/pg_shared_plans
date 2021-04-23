@@ -314,3 +314,97 @@ EXECUTE ts_lexize('PoStGrEs');
 -- We should see only 1 entry for the current database, which never bypassed
 -- the planner
 SELECT bypass FROM pg_shared_plans WHERE datname = current_database();
+
+--
+-- custom types
+--
+CREATE TYPE comptype AS (r float8, i float8);
+CREATE DOMAIN dcomptype AS comptype;
+CREATE TABLE dcomptable (d1 dcomptype unique);
+
+INSERT INTO dcomptable VALUES (row(1,2)::dcomptype);
+INSERT INTO dcomptable VALUES (row(3,4)::comptype);
+INSERT INTO dcomptable (d1.r) VALUES (11);
+
+PREPARE dcomptable(int) AS UPDATE dcomptable SET d1.r = (d1).r + $1 WHERE (d1).i > 0;
+
+EXECUTE dcomptable(0);
+EXECUTE dcomptable(1);
+
+-- plan should be cached and bypassed planner once
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%dcomptable%';
+
+-- Should discard the plan
+ALTER DOMAIN dcomptype ADD CONSTRAINT c1 CHECK ((value).r <= (value).i);
+SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%dcomptable%';
+
+-- Should fail
+EXECUTE dcomptable(1);
+
+CREATE TABLE domtab (col1 integer, col2 integer);
+CREATE DOMAIN dom AS integer;
+CREATE VIEW domview AS SELECT cast(col1 AS dom), col2 from domtab;
+INSERT INTO domtab (col1, col2) VALUES (NULL, 1);
+INSERT INTO domtab (col1, col2) VALUES (5, 1);
+
+PREPARE domview(int) AS SELECT * FROM domview WHERE col2 = $1 ORDER BY col1;
+
+EXECUTE domview(1);
+EXECUTE domview(1);
+
+-- plan should be cached and bypassed planner once
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%domview%';
+
+-- Should discard the plan
+ALTER DOMAIN dom SET NOT NULL;
+SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%domview%';
+
+-- Should fail
+EXECUTE domview(1);
+
+CREATE DOMAIN di AS int;
+CREATE FUNCTION dom_check(int) RETURNS di AS $$
+DECLARE d di;
+BEGIN
+  d := $1::di;
+  RETURN d;
+END
+$$ LANGUAGE PLPGSQL IMMUTABLE;
+
+PREPARE dom_check(int) AS SELECT dom_check($1);
+
+EXECUTE dom_check(0);
+EXECUTE dom_check(0);
+
+-- plan should be cached and bypassed planner once
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%dom_check%';
+
+-- Should not discard the plan
+ALTER DOMAIN di ADD CONSTRAINT pos CHECK (value > 0);
+SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%dom_check%';
+
+-- Should fail
+EXECUTE dom_check(0);
+
+-- implicit cast during assigment is a separate code path, test that too
+ALTER DOMAIN di DROP CONSTRAINT pos;
+EXECUTE dom_check(0);
+
+CREATE OR REPLACE FUNCTION dom_check(int) RETURNS di AS $$
+DECLARE d di;
+BEGIN
+  d := $1;
+  RETURN d;
+END
+$$ LANGUAGE PLPGSQL IMMUTABLE;
+
+EXECUTE dom_check(0);
+SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%dom_check%';
+
+ALTER DOMAIN di ADD CONSTRAINT pos CHECK (value > 0);
+SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%dom_check%';
+
+-- Should fail
+EXECUTE dom_check(0);
+
+SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%dom_check%';

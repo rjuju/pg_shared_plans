@@ -19,9 +19,11 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_inherits.h"
 #include "commands/tablecmds.h"
-#include "nodes/pg_list.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
+#include "nodes/pg_list.h"
+#include "parser/parse_type.h"
 #include "storage/lwlock.h"
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
@@ -482,5 +484,26 @@ pgsp_utility_post_exec(Node *parsetree, pgspUtilityContext *c)
 			else
 				discard_oids(RELOID, pgsp_get_inheritance_ancestors(oid), c);
 		}
+	}
+	else if (IsA(parsetree, AlterDomainStmt))
+	{
+		AlterDomainStmt	   *atd = (AlterDomainStmt *) parsetree;
+		TypeName		   *typename;
+		Oid					domainoid;
+		uint32				hashValue;
+
+		/* Make a TypeName so we can use standard type lookup machinery */
+		typename = makeTypeNameFromNameList(atd->typeName);
+		domainoid = typenameTypeId(NULL, typename);
+
+		Assert(OidIsValid(domainoid));
+
+		/*
+		 * Saved type dependencies are done using standard PlanInvalItem
+		 * infrastructure which doesn't track the oid but its hash value, so we
+		 * have to discard plans using the same hash value.
+		 */
+		hashValue = GetSysCacheHashValue1(TYPEOID, ObjectIdGetDatum(domainoid));
+		discard_oid(TYPEOID, hashValue, c);
 	}
 }
