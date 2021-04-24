@@ -162,12 +162,12 @@ static void pg_shared_plans_shutdown(Datum arg);
 
 static void pgsp_accum_custom_plan(pgspHashKey *key, Cost cost);
 static void pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire);
-static bool pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
-							   pgspHashKey *key);
+static bool pgsp_allocate_plan(Query *parse, PlannedStmt *stmt,
+							   pgspDsaContext *context, pgspHashKey *key);
 static bool pgsp_choose_cache_plan(pgspEntry *entry, bool *accum_custom_stats);
 static const char *pgsp_get_plan(dsa_pointer plan);
-static void pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic,
-		pgspHashKey *key, double plantime, int num_const);
+static void pgsp_cache_plan(Query *parse, PlannedStmt *custom,
+		PlannedStmt *generic, pgspHashKey *key, double plantime, int num_const);
 static Size pgsp_memsize(void);
 static pgspEntry *pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context,
 		double plantime, int num_const, Cost custom_cost, Cost generic_cost);
@@ -418,7 +418,7 @@ pgsp_planner_hook(Query *parse,
 				  int cursorOptions,
 				  ParamListInfo boundParams)
 {
-	Query		   *generic_parse;
+	Query		   *generic_parse, *back_parse;
 	PlannedStmt	   *result, *generic;
 	pgspHashKey		key;
 	pgspEntry	   *entry;
@@ -573,6 +573,7 @@ pgsp_planner_hook(Query *parse,
 	if (!entry)
 	{
 		generic_parse = copyObject(parse);
+		back_parse = copyObject(parse);
 		INSTR_TIME_SET_CURRENT(planstart);
 	}
 
@@ -605,7 +606,8 @@ pgsp_planner_hook(Query *parse,
 								   query_string,
 #endif
 								   cursorOptions, NULL);
-		pgsp_cache_plan(result, generic, &key, plantime, context.num_const);
+		pgsp_cache_plan(back_parse, result, generic, &key, plantime,
+				context.num_const);
 	}
 	else if (accum_custom_stats)
 	{
@@ -984,19 +986,23 @@ pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire)
 	}
 }
 
+#define PGSP_ITEM_NOT_HANDLED(i)	((i)->cacheId != TYPEOID && \
+									(i)->cacheId != PROCOID)
 static bool
-pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
+pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 				   pgspHashKey *key)
 {
 	char	   *local;
 	char	   *serialized;
 	List	   *oids = NIL;
+	List	   *invalItems = NIL, *rels = NIL;
+	bool		hasRowSecurity;
 	Oid		   *array = NULL;
 	ListCell   *lc;
 	bool		ok = true;
 	int			i;
 	int			nb_alloced_rels = 0;
-	int			nb_alloced_typ = 0;
+	int			nb_alloced_inval;
 
 	Assert(!LWLockHeldByMe(pgsp->lock));
 	Assert(context->plan == InvalidDsaPointer);
@@ -1077,23 +1083,25 @@ pgsp_allocate_plan(PlannedStmt *stmt, pgspDsaContext *context,
 		}
 	}
 
-	/* Also save TYPEOID dependency. */
-	i = 0;
-	foreach(lc, stmt->invalItems)
+	/* Also save handled PlanInvanItem dependencies. */
+	extract_query_dependencies((Node *) parse, &rels, &invalItems,
+			&hasRowSecurity);
+	invalItems = list_concat(invalItems, stmt->invalItems);
+
+	nb_alloced_inval = 0;
+	foreach(lc, invalItems)
 	{
 		PlanInvalItem *item = (PlanInvalItem *) lfirst(lc);
 
-		if (item->cacheId != TYPEOID)
+		if (PGSP_ITEM_NOT_HANDLED(item))
 			continue;
 
 		ok = pgsp_entry_register_rdepend(MyDatabaseId, item->cacheId,
 										 item->hashValue, key);
 		if (!ok)
-		{
-			nb_alloced_typ = i;
 			goto free_plans;
-		}
-		i++;
+
+		nb_alloced_inval++;
 	}
 
 free_plans:
@@ -1101,21 +1109,21 @@ free_plans:
 	 * If we couldn't register a type dependency, free all previously
 	 * allocated shared memory.
 	 */
-	if (!ok && nb_alloced_typ > 0)
+	if (!ok && nb_alloced_inval > 0)
 	{
 		i = 0;
-		foreach(lc, stmt->invalItems)
+		foreach(lc, invalItems)
 		{
 			PlanInvalItem *item = (PlanInvalItem *) lfirst(lc);
 
-			if (item->cacheId != TYPEOID)
+			if (PGSP_ITEM_NOT_HANDLED(item))
 				continue;
 
 			pgsp_entry_unregister_rdepend(MyDatabaseId, item->cacheId,
 										  item->hashValue, key);
 
 			i++;
-			if (i > nb_alloced_typ)
+			if (i > nb_alloced_inval)
 				break;
 		}
 	}
@@ -1283,8 +1291,8 @@ pgsp_get_plan(dsa_pointer plan)
  * the plan with.
  */
 static void
-pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic, pgspHashKey *key,
-				double plantime, int num_const)
+pgsp_cache_plan(Query *parse, PlannedStmt *custom, PlannedStmt *generic,
+				pgspHashKey *key, double plantime, int num_const)
 {
 	pgspDsaContext context = {0};
 	pgspEntry *entry PG_USED_FOR_ASSERTS_ONLY;
@@ -1295,7 +1303,7 @@ pgsp_cache_plan(PlannedStmt *custom, PlannedStmt *generic, pgspHashKey *key,
 	 * We store the plan is shared memory before acquiring the lwlock.  It
 	 * means that we may have to free it, but it avoids locking overhead.
 	 */
-	if (!pgsp_allocate_plan(generic, &context, key))
+	if (!pgsp_allocate_plan(parse, generic, &context, key))
 	{
 		/*
 		 * Don't try to allocate a new entry if we couldn't store the plan in

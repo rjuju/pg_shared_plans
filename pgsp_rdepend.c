@@ -51,7 +51,7 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
 	Assert(area != NULL && pgsp_rdepend != NULL);
 
-	if (classid != RELOID && classid != TYPEOID)
+	if (classid != RELOID && classid != TYPEOID && classid != PROCOID)
 		elog(ERROR, "pgsp: rdepend classid %d not handled", classid);
 
 	rentry = dshash_find_or_insert(pgsp_rdepend, &rkey, &found);
@@ -168,7 +168,7 @@ pgsp_entry_unregister_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
 	Assert(area != NULL);
 
-	if (classid != RELOID && classid != TYPEOID)
+	if (classid != RELOID && classid != TYPEOID && classid != PROCOID)
 		elog(ERROR, "pgsp: rdepend classid %d not handled", classid);
 
 	rentry = dshash_find(pgsp_rdepend, &rkey, true);
@@ -220,6 +220,11 @@ pgsp_get_rdep_name(Oid classid, Oid oid, char **deptype, char **depname)
 		else
 			*depname = "<null>";
 		*deptype = "type";
+	}
+	else if (classid == PROCOID)
+	{
+		*depname = get_func_name(oid);
+		*deptype = "routine";
 	}
 	else
 	{
