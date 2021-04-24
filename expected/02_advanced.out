@@ -827,6 +827,7 @@ EXECUTE dom_check(0);
          0
 (1 row)
 
+-- Should discard the plan
 CREATE OR REPLACE FUNCTION dom_check(int) RETURNS di AS $$
 DECLARE d di;
 BEGIN
@@ -843,14 +844,14 @@ EXECUTE dom_check(0);
 SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%dom_check%';
  bypass | discard 
 --------+---------
-      4 |       0
+      3 |       1
 (1 row)
 
 ALTER DOMAIN di ADD CONSTRAINT pos CHECK (value > 0);
 SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%dom_check%';
  bypass | discard 
 --------+---------
-      4 |       0
+      3 |       1
 (1 row)
 
 -- Should fail
@@ -860,6 +861,65 @@ CONTEXT:  PL/pgSQL function dom_check(integer) line 4 at assignment
 SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%dom_check%';
  bypass | discard 
 --------+---------
-      4 |       0
+      3 |       1
+(1 row)
+
+--
+-- dependencies on functions
+--
+CREATE TYPE myfunc_type AS (f1 integer, f2 integer);
+CREATE FUNCTION myfunc() RETURNS myfunc_type AS $$
+  SELECT 1, 2;
+$$ LANGUAGE sql IMMUTABLE;
+PREPARE myfunc(integer) AS SELECT myfunc() WHERE 1 != $1;
+EXECUTE myfunc(0);
+ myfunc 
+--------
+ (1,2)
+(1 row)
+
+EXECUTE myfunc(0);
+ myfunc 
+--------
+ (1,2)
+(1 row)
+
+-- plan should be cached and bypassed planner once
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%myfunc%';
+ bypass 
+--------
+      1
+(1 row)
+
+-- should discard the plan
+CREATE OR REPLACE FUNCTION myfunc() RETURNS myfunc_type AS $$
+  SELECT 3, 4;
+$$ LANGUAGE sql VOLATILE;
+SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%myfunc%';
+ bypass | discard 
+--------+---------
+      1 |       1
+(1 row)
+
+EXECUTE myfunc(0);
+ myfunc 
+--------
+ (3,4)
+(1 row)
+
+-- should discard the plan
+ALTER FUNCTION myfunc() STABLE;
+SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%myfunc%';
+ bypass | discard 
+--------+---------
+      1 |       2
+(1 row)
+
+-- should evict the entry
+DROP FUNCTION myfunc();
+SELECT count(*) FROM pg_shared_plans WHERE query LIKE '%myfunc%';
+ count 
+-------
+     0
 (1 row)
 

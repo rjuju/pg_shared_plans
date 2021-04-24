@@ -390,6 +390,7 @@ EXECUTE dom_check(0);
 ALTER DOMAIN di DROP CONSTRAINT pos;
 EXECUTE dom_check(0);
 
+-- Should discard the plan
 CREATE OR REPLACE FUNCTION dom_check(int) RETURNS di AS $$
 DECLARE d di;
 BEGIN
@@ -408,3 +409,36 @@ SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%dom_check%';
 EXECUTE dom_check(0);
 
 SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%dom_check%';
+
+--
+-- dependencies on functions
+--
+CREATE TYPE myfunc_type AS (f1 integer, f2 integer);
+CREATE FUNCTION myfunc() RETURNS myfunc_type AS $$
+  SELECT 1, 2;
+$$ LANGUAGE sql IMMUTABLE;
+
+PREPARE myfunc(integer) AS SELECT myfunc() WHERE 1 != $1;
+
+EXECUTE myfunc(0);
+EXECUTE myfunc(0);
+
+-- plan should be cached and bypassed planner once
+SELECT bypass FROM pg_shared_plans WHERE query LIKE '%myfunc%';
+
+-- should discard the plan
+CREATE OR REPLACE FUNCTION myfunc() RETURNS myfunc_type AS $$
+  SELECT 3, 4;
+$$ LANGUAGE sql VOLATILE;
+SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%myfunc%';
+
+EXECUTE myfunc(0);
+
+-- should discard the plan
+ALTER FUNCTION myfunc() STABLE;
+SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%myfunc%';
+
+-- should evict the entry
+DROP FUNCTION myfunc();
+
+SELECT count(*) FROM pg_shared_plans WHERE query LIKE '%myfunc%';

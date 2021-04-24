@@ -18,13 +18,18 @@
 #include "catalog/partition.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_language.h"
+#include "catalog/pg_proc.h"
+#include "catalog/pg_type.h"
 #include "commands/tablecmds.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
+#include "parser/parse_func.h"
 #include "parser/parse_type.h"
 #include "storage/lwlock.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -285,6 +290,24 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 				/* Handled types. */
 				objs_remove = drop->objects;
 				break;
+			case OBJECT_AGGREGATE:
+			case OBJECT_FUNCTION:
+			case OBJECT_PROCEDURE:
+			case OBJECT_ROUTINE:
+				foreach(cell, drop->objects)
+				{
+					Node *object = lfirst(cell);
+					Oid oid = LookupFuncWithArgs(drop->removeType,
+							castNode(ObjectWithArgs, object), true);
+					uint32				hashValue;
+
+					if (OidIsValid(oid))
+					{
+						hashValue = GetSysCacheHashValue1(PROCOID, ObjectIdGetDatum(oid));
+						remove_oid(PROCOID, hashValue, c);
+					}
+				}
+				break;
 			default:
 				/* nothing to do. */
 				break;
@@ -360,6 +383,146 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 			elog(ERROR, "pg_shared_plans: can't run ALTER TEXT SEARCH"
 					" DICTIONNARY in a transaction.");
 		c->reset_current_db = true;
+	}
+	else if (IsA(parsetree, CreateFunctionStmt))
+	{
+		/*
+		 * We might have to discard cached plan, but only if this ia a CREATE
+		 * OR REPLACE of an already existing function, otherwise we obviously
+		 * can't have saved reference to it.  To avoid looking for reverse
+		 * dependencies as much as possible, we handle CreateFunction before
+		 * the UTILITY execution as it's the only way to know if the function
+		 * previously existed or not.
+		 */
+		CreateFunctionStmt *stmt = (CreateFunctionStmt *) parsetree;
+		int			parameterCount = list_length(stmt->parameters);
+		DefElem    *language_item = NULL;
+		Form_pg_language languageStruct;
+		HeapTuple	tup;
+		char	   *language;
+		Oid			languageOid;
+		char		   *funcname;
+		Oid			namespaceId;
+		oidvector  *parameterTypes;
+		Oid		   *sigArgTypes;
+		int			sigArgCount = 0;
+		int			varCount = 0;
+		ListCell	   *x;
+
+		if (!stmt->replace)
+			return;
+
+		/* Convert list of names to a name and namespace */
+		namespaceId = QualifiedNameGetCreationNamespace(stmt->funcname,
+														&funcname);
+
+		/* get language */
+		foreach(x, stmt->options)
+		{
+			DefElem    *defel = (DefElem *) lfirst(x);
+
+			if (strcmp(defel->defname, "language") != 0)
+				continue;
+
+			/* Will error out in UTILITY execution, ignore. */
+			if (language_item)
+				return;
+
+			language_item = defel;
+		}
+
+		/* Will error out in UTILITY execution, ignore. */
+		if (!language_item)
+			return;
+
+		language = strVal(language_item->arg);
+		tup = SearchSysCache1(LANGNAME, PointerGetDatum(language));
+
+		/* Will error out in UTILITY execution, ignore. */
+		if (!HeapTupleIsValid(tup))
+			return;
+
+		languageStruct = (Form_pg_language) GETSTRUCT(tup);
+		languageOid = languageStruct->oid;
+		ReleaseSysCache(tup);
+
+		sigArgTypes = (Oid *) palloc(parameterCount * sizeof(Oid));
+
+		foreach(x, stmt->parameters)
+		{
+			FunctionParameter *fp = (FunctionParameter *) lfirst(x);
+			TypeName   *t = fp->argType;
+			Oid			toid;
+			Type		typtup;
+
+			typtup = LookupTypeName(NULL, t, NULL, false);
+			if (typtup)
+			{
+				if (!((Form_pg_type) GETSTRUCT(typtup))->typisdefined)
+				{
+					/* Will error out in UTILITY execution, ignore. */
+					if (languageOid == SQLlanguageId)
+						return;
+				}
+				toid = typeTypeId(typtup);
+				ReleaseSysCache(typtup);
+			}
+			else
+			{
+				/* Will error out in UTILITY execution, ignore. */
+				return;
+			}
+
+			/* handle signature parameters */
+			if (fp->mode == FUNC_PARAM_IN || fp->mode == FUNC_PARAM_INOUT ||
+				(stmt->is_procedure && fp->mode == FUNC_PARAM_OUT) ||
+				fp->mode == FUNC_PARAM_VARIADIC)
+			{
+				/* Will error out in UTILITY execution, ignore. */
+				if (varCount > 0)
+					return;
+				sigArgTypes[sigArgCount++] = toid;
+			}
+
+			if (fp->mode == FUNC_PARAM_VARIADIC)
+			{
+				varCount++;
+				/* validate variadic parameter type */
+				switch (toid)
+				{
+					case ANYARRAYOID:
+					case ANYCOMPATIBLEARRAYOID:
+					case ANYOID:
+						/* okay */
+						break;
+					default:
+						if (!OidIsValid(get_element_type(toid)))
+						{
+							/* Will error out in UTILITY execution, ignore. */
+							return;
+						}
+				}
+			}
+		}
+
+		/* Now construct the proper outputs as needed */
+		parameterTypes = buildoidvector(sigArgTypes, sigArgCount);
+
+		tup = SearchSysCache3(PROCNAMEARGSNSP,
+				PointerGetDatum(funcname),
+				PointerGetDatum(parameterTypes),
+				ObjectIdGetDatum(namespaceId));
+
+		if (HeapTupleIsValid(tup))
+		{
+			Form_pg_proc oldproc = (Form_pg_proc) GETSTRUCT(tup);
+			uint32		hashValue;
+
+			hashValue = GetSysCacheHashValue1(PROCOID, ObjectIdGetDatum(oldproc->oid));
+			discard_oid(PROCOID, hashValue, c);
+
+			ReleaseSysCache(tup);
+		}
 	}
 }
 
@@ -505,5 +668,21 @@ pgsp_utility_post_exec(Node *parsetree, pgspUtilityContext *c)
 		 */
 		hashValue = GetSysCacheHashValue1(TYPEOID, ObjectIdGetDatum(domainoid));
 		discard_oid(TYPEOID, hashValue, c);
+	}
+	else if (IsA(parsetree, AlterFunctionStmt))
+	{
+		AlterFunctionStmt *stmt = (AlterFunctionStmt *) parsetree;
+		Oid			funcOid;
+
+		funcOid = LookupFuncWithArgs(stmt->objtype, stmt->func, false);
+
+		if (OidIsValid(funcOid))
+		{
+			uint32				hashValue;
+
+			hashValue = GetSysCacheHashValue1(PROCOID,
+											  ObjectIdGetDatum(funcOid));
+			discard_oid(PROCOID, hashValue, c);
+		}
 	}
 }
