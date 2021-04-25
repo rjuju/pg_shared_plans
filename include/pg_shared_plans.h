@@ -37,6 +37,9 @@ typedef struct pgspEntry
 	dsa_pointer plan;		/* only modified holding exclusive pgsp->lock */
 	int			num_rels;	/* # of referenced base relations */
 	dsa_pointer rels;		/* only modified holding exclusive pgsp->lock */
+	int			num_rdeps;	/* # of non relation reverse dependencies */
+	dsa_pointer rdeps;		/* array of pgspRdependKey - only modified holding
+							   exclusive pgsp_lock */
 	int			num_const;	/* # of const values in the plan */
 	double		plantime;	/* first generic planning time */
 	Cost		generic_cost; /* total cost of the stored plan */

@@ -74,8 +74,10 @@ typedef struct pgspDsaContext
 {
 	dsa_pointer		plan;
 	dsa_pointer		rels;
+	int				num_rdeps;
 	size_t			len;
 	int				num_rels;
+	dsa_pointer		rdeps;
 } pgspDsaContext;
 
 typedef struct pgspWalkerContext
@@ -1003,6 +1005,7 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 	int			i;
 	int			nb_alloced_rels = 0;
 	int			nb_alloced_inval;
+	pgspRdependKey *rdeps, *rdeps_tmp;
 
 	Assert(!LWLockHeldByMe(pgsp->lock));
 	Assert(context->plan == InvalidDsaPointer);
@@ -1089,6 +1092,8 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 	invalItems = list_concat(invalItems, stmt->invalItems);
 
 	nb_alloced_inval = 0;
+	rdeps_tmp = (pgspRdependKey *) palloc(sizeof(pgspRdependKey) *
+			list_length(invalItems));
 	foreach(lc, invalItems)
 	{
 		PlanInvalItem *item = (PlanInvalItem *) lfirst(lc);
@@ -1101,8 +1106,29 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 		if (!ok)
 			goto free_plans;
 
+		rdeps_tmp[nb_alloced_inval].dbid = MyDatabaseId;
+		rdeps_tmp[nb_alloced_inval].classid = item->cacheId;
+		rdeps_tmp[nb_alloced_inval].oid = item->hashValue;
 		nb_alloced_inval++;
 	}
+
+	if (nb_alloced_inval > 0)
+	{
+		context->rdeps = dsa_allocate_extended(area,
+				sizeof(pgspRdependKey) * nb_alloced_inval,
+				DSA_ALLOC_NO_OOM);
+
+		if (context->rdeps == InvalidDsaPointer)
+		{
+			ok = false;
+			goto free_plans;
+		}
+
+		rdeps = dsa_get_address(area, context->rdeps);
+		memcpy(rdeps, rdeps_tmp, sizeof(pgspRdependKey) * nb_alloced_inval);
+	}
+
+	context->num_rdeps = nb_alloced_inval;
 
 free_plans:
 	/*
@@ -1412,6 +1438,8 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 		entry->plan = context->plan;
 		entry->num_rels = context->num_rels;
 		entry->rels = context->rels;
+		entry->num_rdeps = context->num_rdeps;
+		entry->rdeps = context->rdeps;
 		entry->num_const = num_const;
 		entry->plantime = plantime;
 		entry->generic_cost = generic_cost;
@@ -1532,15 +1560,14 @@ pgsp_entry_dealloc(void)
 }
 
 /*
- * Remove an entry from the hash table and free associated dsa pointers.
- * FIXME: need to store referenced to non relation rdepend so we can free them
- * here.
+ * Completely remove an entry:
+ * - free associated dsa pointers and underlying memory
+ * - unregister all underlying reverse dependencies entries.
+ * - remove the entry itself from the hash table
  */
 static void
 pgsp_entry_remove(pgspEntry *entry)
 {
-	Oid *array = NULL;
-
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
 	Assert(area != NULL);
 
@@ -1548,9 +1575,12 @@ pgsp_entry_remove(pgspEntry *entry)
 	if (entry->plan != InvalidDsaPointer)
 		dsa_free(area, entry->plan);
 
-	if (entry->rels != InvalidDsaPointer)
+	if (entry->num_rels > 0)
 	{
+		Oid *array = NULL;
 		int i;
+
+		Assert(entry->rels != InvalidDsaPointer);
 
 		array = (Oid *) dsa_get_address(area, entry->rels);
 
@@ -1558,6 +1588,28 @@ pgsp_entry_remove(pgspEntry *entry)
 			pgsp_entry_unregister_rdepend(entry->key.dbid, RELOID,
 										  array[i], &entry->key);
 		dsa_free(area, entry->rels);
+	}
+	else
+	{
+		Assert(entry->rels == InvalidDsaPointer);
+	}
+
+	if (entry->num_rdeps > 0)
+	{
+		pgspRdependKey *rdeps;
+		int i;
+
+		Assert(entry->rdeps != InvalidDsaPointer);
+
+		rdeps = (pgspRdependKey *) dsa_get_address(area, entry->rdeps);
+		for (i = 0; i < entry->num_rdeps; i++)
+			pgsp_entry_unregister_rdepend(rdeps[i].dbid, rdeps[i].classid,
+										  rdeps[i].oid, &entry->key);
+		dsa_free(area, entry->rdeps);
+	}
+	else
+	{
+		Assert(entry->rdeps == InvalidDsaPointer);
 	}
 
 	/* And remove the hash entry. */
