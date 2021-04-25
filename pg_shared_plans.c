@@ -1162,7 +1162,8 @@ pgsp_evict_by_oid(Oid dbid, Oid classid, Oid relid, pgspEvictionKind kind)
 	pgspRdependKey		rkey = {dbid, classid, relid};
 	pgspRdependEntry   *rentry;
 	pgspHashKey		   *rkeys;
-	int					i;
+	size_t				size;
+	int					i, num_keys;
 
 	if (kind == PGSP_UNLOCK)
 		Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
@@ -1178,10 +1179,21 @@ pgsp_evict_by_oid(Oid dbid, Oid classid, Oid relid, pgspEvictionKind kind)
 
 	Assert(rentry->keys != InvalidDsaPointer);
 
-	rkeys = (pgspHashKey *) dsa_get_address(area, rentry->keys);
-	Assert(rkeys != NULL);
+	Assert(dsa_get_address(area, rentry->keys) != NULL);
 
-	for(i = 0; i < rentry->num_keys; i++)
+	num_keys = rentry->num_keys;
+	size = sizeof(pgspHashKey) * num_keys;
+	rkeys = (pgspHashKey *) palloc(size);
+	memcpy(rkeys, dsa_get_address(area, rentry->keys), size);
+
+	/*
+	 * We can release the lock now as we hold a (possibly shared) lock on
+	 * pgsp->lock, so no other backend can discard plans or evict entries
+	 * concurrently.
+	 */
+	dshash_release_lock(pgsp_rdepend, rentry);
+
+	for(i = 0; i < num_keys; i++)
 	{
 		pgspEntry *entry;
 
@@ -1216,11 +1228,12 @@ pgsp_evict_by_oid(Oid dbid, Oid classid, Oid relid, pgspEvictionKind kind)
 			}
 
 			if(kind == PGSP_EVICT)
-				hash_search(pgsp_hash, &entry->key, HASH_REMOVE, NULL);
+			{
+				/* We don't hold any lock on the pgsp_rdepend at this point. */
+				pgsp_entry_remove(entry);
+			}
 		}
 	}
-
-	dshash_release_lock(pgsp_rdepend, rentry);
 }
 
 /*
@@ -1518,7 +1531,11 @@ pgsp_entry_dealloc(void)
 	}
 }
 
-/* Remove an entry from the hash table and free associated dsa pointers. */
+/*
+ * Remove an entry from the hash table and free associated dsa pointers.
+ * FIXME: need to store referenced to non relation rdepend so we can free them
+ * here.
+ */
 static void
 pgsp_entry_remove(pgspEntry *entry)
 {
