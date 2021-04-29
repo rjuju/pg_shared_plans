@@ -45,7 +45,9 @@ static pgspOidsEntry *get_oids_entry(pgspEvictionKind kind, Oid classid,
 static void discard_oid(Oid classid, Oid oid, pgspUtilityContext *c);
 static void discard_oids(Oid classid, List *oids, pgspUtilityContext *c);
 static void lock_oid(Oid classid, Oid oid, pgspUtilityContext *c);
+#if PG_VERSION_NUM >= 140000
 static void lock_oids(Oid classid, List *oids, pgspUtilityContext *c);
+#endif
 static void remove_oid(Oid classid, Oid oid, pgspUtilityContext *c);
 
 static void
@@ -120,6 +122,7 @@ lock_oid(Oid classid, Oid oid, pgspUtilityContext *c)
 	c->has_lock = true;
 }
 
+#if PG_VERSION_NUM >= 140000
 static void
 lock_oids(Oid classid, List *oids, pgspUtilityContext *c)
 {
@@ -132,6 +135,7 @@ lock_oids(Oid classid, List *oids, pgspUtilityContext *c)
 	entry->oids = list_concat_unique_oid(entry->oids, oids);
 	c->has_lock = true;
 }
+#endif
 
 static void
 remove_oid(Oid classid, Oid oid, pgspUtilityContext *c)
@@ -325,6 +329,7 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 				remove_oid(RELOID, oid, c);
 		}
 	}
+#if PG_VERSION_NUM >= 140000
 	else if (IsA(parsetree, AlterTableStmt))
 	{
 		AlterTableStmt *atstmt = (AlterTableStmt *) parsetree;
@@ -362,6 +367,7 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 			}
 		}
 	}
+#endif
 	else if (IsA(parsetree, AlterTSDictionaryStmt))
 	{
 		/* We have no way to track dependencies on TEXT SEARCH DICTIONNARY, so
@@ -491,7 +497,9 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 				switch (toid)
 				{
 					case ANYARRAYOID:
+#if PG_VERSION_NUM >= 130000
 					case ANYCOMPATIBLEARRAYOID:
+#endif
 					case ANYOID:
 						/* okay */
 						break;
@@ -579,10 +587,13 @@ pgsp_utility_post_exec(Node *parsetree, pgspUtilityContext *c)
 			{
 				AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
 
-				if (cmd->subtype == AT_AttachPartition ||
+				if (cmd->subtype == AT_AttachPartition
+#if PG_VERSION_NUM >= 140000
+					||
 					cmd->subtype == AT_DetachPartitionFinalize ||
 					(cmd->subtype == AT_DetachPartition
 						&& !((PartitionCmd *)cmd->def)->concurrent)
+#endif
 				)
 				{
 					Oid oid = AlterTableLookupRelation(atstmt, lockmode);

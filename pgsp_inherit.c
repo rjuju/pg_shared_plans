@@ -14,6 +14,9 @@
 
 #include "access/genam.h"
 #include "access/table.h"
+#if PG_VERSION_NUM < 140000
+#include "catalog/indexing.h"
+#endif
 #include "catalog/pg_inherits.h"
 #include "nodes/pg_list.h"
 #include "utils/fmgroids.h"

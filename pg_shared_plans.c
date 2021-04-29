@@ -1673,12 +1673,14 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 			 */
 			context->constid = hash_combine(context->constid, rte->inh);
 
+#if PG_VERSION_NUM >= 130000
 			/*
 			 * pg_stat_statements doesn't take into account the limit option
 			 * (ONLY / WITH TIES).
 			 */
 			context->constid = hash_combine(context->constid,
 											query->limitOption);
+#endif
 
 			/*
 			 * pg_stat_statements doesn't take into account the alias colnames,
@@ -1700,8 +1702,10 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 			}
 		}
 
+#if PG_VERSION_NUM >= 140000
 		/* pg_stat_statements doesn't take into account groupDistinct */
 		context->constid = hash_combine(context->constid, query->groupDistinct);
+#endif
 
 		/*
 		 * pg_stat_statements doesn't take into account the alias colnames,
