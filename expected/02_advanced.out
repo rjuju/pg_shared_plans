@@ -923,3 +923,24 @@ SELECT count(*) FROM pg_shared_plans WHERE query LIKE '%myfunc%';
      0
 (1 row)
 
+--
+-- xmlpi
+--
+PREPARE myxmlpi1(text) AS SELECT xmlpi(name foo, $1);
+PREPARE myxmlpi2(text) AS SELECT xmlpi(name xml, $1);
+EXECUTE myxmlpi1('test');
+    xmlpi     
+--------------
+ <?foo test?>
+(1 row)
+
+EXECUTE myxmlpi1('test');
+    xmlpi     
+--------------
+ <?foo test?>
+(1 row)
+
+-- should fail
+EXECUTE myxmlpi2('test');
+ERROR:  invalid XML processing instruction
+DETAIL:  XML processing instruction target name cannot be "xml".

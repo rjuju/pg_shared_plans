@@ -442,3 +442,14 @@ SELECT bypass, discard FROM pg_shared_plans WHERE query LIKE '%myfunc%';
 DROP FUNCTION myfunc();
 
 SELECT count(*) FROM pg_shared_plans WHERE query LIKE '%myfunc%';
+
+--
+-- xmlpi
+--
+PREPARE myxmlpi1(text) AS SELECT xmlpi(name foo, $1);
+PREPARE myxmlpi2(text) AS SELECT xmlpi(name xml, $1);
+
+EXECUTE myxmlpi1('test');
+EXECUTE myxmlpi1('test');
+-- should fail
+EXECUTE myxmlpi2('test');

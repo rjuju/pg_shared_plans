@@ -1759,6 +1759,20 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 		/* pg_stat_statement doesn't take into account agglevelsup */
 		context->constid = hash_combine(context->constid, gf->agglevelsup);
 	}
+	else if (IsA(node, XmlExpr))
+	{
+		XmlExpr *expr = (XmlExpr *) node;
+
+		/*
+		 * pg_stat_statement doesn't take into account the name in
+		 * xml(NAME foo ...) syntaxes.
+		 */
+		if (expr->name)
+		{
+			context->constid = hash_combine(context->constid,
+					hash_any((unsigned char *) expr->name, strlen(expr->name)));
+		}
+	}
 
 	return expression_tree_walker(node, pgsp_query_walker, context);
 }
