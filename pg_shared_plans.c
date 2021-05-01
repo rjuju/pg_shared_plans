@@ -1773,6 +1773,16 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 					hash_any((unsigned char *) expr->name, strlen(expr->name)));
 		}
 	}
+	else if (IsA(node, Param))
+	{
+		Param *param = (Param *) node;
+
+		/*
+		 * This probably cannot lead to wrong result unless pgsp_cache_all is
+		 * enabled, but let's be safe.
+		 */
+		context->constid = hash_combine(context->constid, param->paramcollid);
+	}
 
 	return expression_tree_walker(node, pgsp_query_walker, context);
 }
