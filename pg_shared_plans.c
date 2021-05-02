@@ -496,6 +496,7 @@ pgsp_planner_hook(Query *parse,
 
 	if (entry)
 	{
+		int64		discard = entry->discard;
 		const char *local = pgsp_get_plan(entry->plan);
 
 		if (local != NULL)
@@ -506,14 +507,32 @@ pgsp_planner_hook(Query *parse,
 
 			if (use_cached)
 			{
-				Cost	total_diff;
-				Cost	diff;
-				int		nb_rels;
-
 				result = (PlannedStmt *) stringToNode(local);
 
 				LWLockRelease(pgsp->lock);
 				pgsp_acquire_executor_locks(result, true);
+
+				/*
+				 * Check that the entry is still valid after acquiring the
+				 * locks.
+				 */
+				LWLockAcquire(pgsp->lock, LW_SHARED);
+				entry = (pgspEntry *) hash_search(pgsp_hash, &key, HASH_FIND,
+												  NULL);
+				if (entry == NULL || entry->plan == InvalidDsaPointer ||
+						entry->discard != discard)
+					use_cached = false;
+
+				entry = NULL;
+				LWLockRelease(pgsp->lock);
+			}
+
+			/* Entry is still valid, keep going. */
+			if (use_cached)
+			{
+				Cost	total_diff;
+				Cost	diff;
+				int		nb_rels;
 
 				/*
 				 * If our threshold is greater or equal than the plancache one,
