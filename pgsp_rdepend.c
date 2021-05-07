@@ -49,7 +49,7 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 	 * hash table.
 	 */
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
-	Assert(area != NULL && pgsp_rdepend != NULL);
+	Assert(pgsp_area != NULL && pgsp_rdepend != NULL);
 
 	if (classid != RELOID && classid != TYPEOID && classid != PROCOID)
 		elog(ERROR, "pgsp: rdepend classid %d not handled", classid);
@@ -60,7 +60,7 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 	{
 		rentry->max_keys = PGSP_RDEPEND_INIT;
 		rentry->num_keys = 0;
-		rentry->keys = dsa_allocate_extended(area,
+		rentry->keys = dsa_allocate_extended(pgsp_area,
 				sizeof(pgspHashKey) * PGSP_RDEPEND_INIT,
 				DSA_ALLOC_NO_OOM);
 
@@ -99,10 +99,10 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 			return false;
 		}
 
-		rkeys = (pgspHashKey *) dsa_get_address(area, rentry->keys);
+		rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
 		Assert(rkeys != NULL);
 
-		new_rkeys_p = dsa_allocate_extended(area,
+		new_rkeys_p = dsa_allocate_extended(pgsp_area,
 											sizeof(pgspHashKey) * new_max_keys,
 											DSA_ALLOC_NO_OOM);
 		if (new_rkeys_p == InvalidDsaPointer)
@@ -120,18 +120,18 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 			return false;
 		}
 
-		new_rkeys = (pgspHashKey *) dsa_get_address(area, new_rkeys_p);
+		new_rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, new_rkeys_p);
 		Assert(new_rkeys != NULL);
 
 		memcpy(new_rkeys, rkeys, sizeof(pgspHashKey) * new_max_keys);
 		rkeys = NULL;
-		dsa_free(area, rentry->keys);
+		dsa_free(pgsp_area, rentry->keys);
 
 		rentry->keys = new_rkeys_p;
 		rentry->max_keys = new_max_keys;
 	}
 
-	rkeys = (pgspHashKey *) dsa_get_address(area, rentry->keys);
+	rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
 	Assert(rkeys != NULL);
 
 	/* Check first if the rdepend is already registered */
@@ -166,7 +166,7 @@ pgsp_entry_unregister_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 	int					delidx;
 
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
-	Assert(area != NULL);
+	Assert(pgsp_area != NULL);
 
 	if (classid != RELOID && classid != TYPEOID && classid != PROCOID)
 		elog(ERROR, "pgsp: rdepend classid %d not handled", classid);
@@ -178,7 +178,7 @@ pgsp_entry_unregister_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 
 	Assert(rentry->keys != InvalidDsaPointer);
 
-	rkeys = (pgspHashKey *) dsa_get_address(area, rentry->keys);
+	rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
 	for(delidx = 0; delidx < rentry->num_keys; delidx++)
 	{
 		if (pgsp_match_fn(key, &(rkeys[delidx]), 0) == 0)

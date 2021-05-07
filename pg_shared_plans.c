@@ -104,7 +104,7 @@ static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 /* Links to shared memory state */
 pgspSharedState *pgsp = NULL;
 HTAB *pgsp_hash = NULL;
-dsa_area *area = NULL;
+dsa_area *pgsp_area = NULL;
 dshash_table *pgsp_rdepend = NULL;
 
 /*---- GUC variables ----*/
@@ -798,7 +798,7 @@ pgsp_attach_dsa(void)
 	Assert(!LWLockHeldByMe(pgsp->lock));
 
 	/* Nothing to do if we're already attached to the dsa. */
-	if (area != NULL)
+	if (pgsp_area != NULL)
 	{
 		Assert(pgsp_rdepend != NULL);
 		return;
@@ -809,31 +809,31 @@ pgsp_attach_dsa(void)
 	LWLockAcquire(pgsp->lock, LW_EXCLUSIVE);
 	if (pgsp->pgsp_dsa_handle == DSM_HANDLE_INVALID)
 	{
-		area = dsa_create(pgsp->LWTRANCHE_PGSP);
-		dsa_pin(area);
-		pgsp->pgsp_dsa_handle = dsa_get_handle(area);
+		pgsp_area = dsa_create(pgsp->LWTRANCHE_PGSP);
+		dsa_pin(pgsp_area);
+		pgsp->pgsp_dsa_handle = dsa_get_handle(pgsp_area);
 	}
 	else
-		area = dsa_attach(pgsp->pgsp_dsa_handle);
+		pgsp_area = dsa_attach(pgsp->pgsp_dsa_handle);
 
-	dsa_pin_mapping(area);
+	dsa_pin_mapping(pgsp_area);
 
 	pgsp_rdepend_params.tranche_id = pgsp->LWTRANCHE_PGSP;
 	if (pgsp->pgsp_rdepend_handle == InvalidDsaPointer)
 	{
-		pgsp_rdepend = dshash_create(area, &pgsp_rdepend_params, NULL);
+		pgsp_rdepend = dshash_create(pgsp_area, &pgsp_rdepend_params, NULL);
 		pgsp->pgsp_rdepend_handle = dshash_get_hash_table_handle(pgsp_rdepend);
 	}
 	else
 	{
-		pgsp_rdepend = dshash_attach(area, &pgsp_rdepend_params,
+		pgsp_rdepend = dshash_attach(pgsp_area, &pgsp_rdepend_params,
 									 pgsp->pgsp_rdepend_handle, NULL);
 	}
 	LWLockRelease(pgsp->lock);
 
 	MemoryContextSwitchTo(oldcontext);
 
-	Assert(area != NULL);
+	Assert(pgsp_area != NULL);
 }
 
 static void
@@ -1029,19 +1029,21 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 	Assert(!LWLockHeldByMe(pgsp->lock));
 	Assert(context->plan == InvalidDsaPointer);
 	Assert(context->rels == InvalidDsaPointer);
-	Assert(area != NULL);
+	Assert(pgsp_area != NULL);
 
 	/* First, allocate space to save a serialized version of the plan. */
 	serialized = nodeToString(stmt);
 	context->len = strlen(serialized) + 1;
 
-	context->plan = dsa_allocate_extended(area, context->len, DSA_ALLOC_NO_OOM);
+	context->plan = dsa_allocate_extended(pgsp_area,
+										  context->len,
+										  DSA_ALLOC_NO_OOM);
 
 	/* If we couldn't allocate memory for the plan, inform caller. */
 	if (context->plan == InvalidDsaPointer)
 		return false;
 
-	local = dsa_get_address(area, context->plan);
+	local = dsa_get_address(pgsp_area, context->plan);
 	Assert(local != NULL);
 
 	/* And copy the plan. */
@@ -1069,7 +1071,9 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 		Assert(oids != NIL);
 
 		array_len = sizeof(Oid) * list_length(oids);
-		context->rels = dsa_allocate_extended(area, array_len, DSA_ALLOC_NO_OOM);
+		context->rels = dsa_allocate_extended(pgsp_area,
+											  array_len,
+											  DSA_ALLOC_NO_OOM);
 
 		/*
 		 * If we couldn't allocate memory for the rels, inform caller but only
@@ -1077,11 +1081,11 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 		 */
 		if (context->plan == InvalidDsaPointer)
 		{
-			dsa_free(area, context->plan);
+			dsa_free(pgsp_area, context->plan);
 			return false;
 		}
 
-		array = dsa_get_address(area, context->rels);
+		array = dsa_get_address(pgsp_area, context->rels);
 
 		i = 0;
 		foreach(lc, oids)
@@ -1133,7 +1137,7 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 
 	if (nb_alloced_inval > 0)
 	{
-		context->rdeps = dsa_allocate_extended(area,
+		context->rdeps = dsa_allocate_extended(pgsp_area,
 				sizeof(pgspRdependKey) * nb_alloced_inval,
 				DSA_ALLOC_NO_OOM);
 
@@ -1143,7 +1147,7 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 			goto free_plans;
 		}
 
-		rdeps = dsa_get_address(area, context->rdeps);
+		rdeps = dsa_get_address(pgsp_area, context->rdeps);
 		memcpy(rdeps, rdeps_tmp, sizeof(pgspRdependKey) * nb_alloced_inval);
 	}
 
@@ -1181,7 +1185,7 @@ free_rels:
 	if (!ok && nb_alloced_rels > 0)
 	{
 		/* Free the plan. */
-		dsa_free(area, context->plan);
+		dsa_free(pgsp_area, context->plan);
 
 		Assert(array != NULL);
 		/* Free all saved rdepend. */
@@ -1189,7 +1193,7 @@ free_rels:
 			pgsp_entry_unregister_rdepend(MyDatabaseId, RELOID, array[i], key);
 
 		/* And free the array of Oid. */
-		dsa_free(area, context->rels);
+		dsa_free(pgsp_area, context->rels);
 	}
 
 	LWLockRelease(pgsp->lock);
@@ -1215,7 +1219,7 @@ pgsp_evict_by_oid(Oid dbid, Oid classid, Oid relid, pgspEvictionKind kind)
 	else
 		Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
 
-	Assert(area != NULL);
+	Assert(pgsp_area != NULL);
 
 	rentry = dshash_find(pgsp_rdepend, &rkey, true);
 
@@ -1224,12 +1228,12 @@ pgsp_evict_by_oid(Oid dbid, Oid classid, Oid relid, pgspEvictionKind kind)
 
 	Assert(rentry->keys != InvalidDsaPointer);
 
-	Assert(dsa_get_address(area, rentry->keys) != NULL);
+	Assert(dsa_get_address(pgsp_area, rentry->keys) != NULL);
 
 	num_keys = rentry->num_keys;
 	size = sizeof(pgspHashKey) * num_keys;
 	rkeys = (pgspHashKey *) palloc(size);
-	memcpy(rkeys, dsa_get_address(area, rentry->keys), size);
+	memcpy(rkeys, dsa_get_address(pgsp_area, rentry->keys), size);
 
 	/*
 	 * We can release the lock now as we hold a (possibly shared) lock on
@@ -1266,7 +1270,7 @@ pgsp_evict_by_oid(Oid dbid, Oid classid, Oid relid, pgspEvictionKind kind)
 			/* We only report a discard of a plan that was previously valid. */
 			if (entry->plan != InvalidDsaPointer)
 			{
-				dsa_free(area, entry->plan);
+				dsa_free(pgsp_area, entry->plan);
 				entry->plan = InvalidDsaPointer;
 				if (kind != PGSP_EVICT)
 					entry->discard++;
@@ -1336,12 +1340,12 @@ static const char *
 pgsp_get_plan(dsa_pointer plan)
 {
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
-	Assert(area != NULL);
+	Assert(pgsp_area != NULL);
 
 	if (plan == InvalidDsaPointer)
 		return NULL;
 
-	return (const char *) dsa_get_address(area, plan);
+	return (const char *) dsa_get_address(pgsp_area, plan);
 }
 
 /*
@@ -1486,9 +1490,9 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 			int		i;
 
 			/* Free the plan. */
-			dsa_free(area, context->plan);
+			dsa_free(pgsp_area, context->plan);
 
-			array = dsa_get_address(area, context->rels);
+			array = dsa_get_address(pgsp_area, context->rels);
 			Assert(array != NULL);
 
 			/* Free all saved rdepend. */
@@ -1497,7 +1501,7 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 											  key);
 
 			/* And free the array of Oid. */
-			dsa_free(area, context->rels);
+			dsa_free(pgsp_area, context->rels);
 		}
 		else
 			entry->plan = context->plan;
@@ -1588,11 +1592,11 @@ static void
 pgsp_entry_remove(pgspEntry *entry)
 {
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_EXCLUSIVE));
-	Assert(area != NULL);
+	Assert(pgsp_area != NULL);
 
 	/* Free the dsa allocated memory. */
 	if (entry->plan != InvalidDsaPointer)
-		dsa_free(area, entry->plan);
+		dsa_free(pgsp_area, entry->plan);
 
 	if (entry->num_rels > 0)
 	{
@@ -1601,12 +1605,12 @@ pgsp_entry_remove(pgspEntry *entry)
 
 		Assert(entry->rels != InvalidDsaPointer);
 
-		array = (Oid *) dsa_get_address(area, entry->rels);
+		array = (Oid *) dsa_get_address(pgsp_area, entry->rels);
 
 		for(i = 0; i < entry->num_rels; i++)
 			pgsp_entry_unregister_rdepend(entry->key.dbid, RELOID,
 										  array[i], &entry->key);
-		dsa_free(area, entry->rels);
+		dsa_free(pgsp_area, entry->rels);
 	}
 	else
 	{
@@ -1620,11 +1624,11 @@ pgsp_entry_remove(pgspEntry *entry)
 
 		Assert(entry->rdeps != InvalidDsaPointer);
 
-		rdeps = (pgspRdependKey *) dsa_get_address(area, entry->rdeps);
+		rdeps = (pgspRdependKey *) dsa_get_address(pgsp_area, entry->rdeps);
 		for (i = 0; i < entry->num_rdeps; i++)
 			pgsp_entry_unregister_rdepend(rdeps[i].dbid, rdeps[i].classid,
 										  rdeps[i].oid, &entry->key);
-		dsa_free(area, entry->rdeps);
+		dsa_free(pgsp_area, entry->rdeps);
 	}
 	else
 	{
@@ -1833,11 +1837,11 @@ do_showrels(dsa_pointer rels, int num_rels)
 	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
 	Assert(rels != InvalidDsaPointer);
 	Assert(num_rels > 0);
-	Assert(area != NULL);
+	Assert(pgsp_area != NULL);
 
 	arrayelems = (Datum *) palloc(sizeof(Datum) * num_rels);
 
-	oids = (Oid *) dsa_get_address(area, rels);
+	oids = (Oid *) dsa_get_address(pgsp_area, rels);
 
 	for (i = 0; i < num_rels; i++)
 		arrayelems[i] = ObjectIdGetDatum(oids[i]);
@@ -2050,7 +2054,7 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 			Assert(rentry->num_keys <= PGSP_RDEPEND_MAX);
 
 			fctx->max_calls = rentry->num_keys;
-			rkeys = (pgspHashKey *) dsa_get_address(area, rentry->keys);
+			rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
 			Assert(rkeys != NULL);
 
 			size = sizeof(pgspHashKey) * rentry->num_keys;

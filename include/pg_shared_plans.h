@@ -78,7 +78,7 @@ typedef struct pgspSharedState
 /* Links to shared memory state */
 extern pgspSharedState *pgsp;
 extern HTAB *pgsp_hash;
-extern dsa_area *area;
+extern dsa_area *pgsp_area;
 extern dshash_table *pgsp_rdepend;
 
 uint32 pgsp_hash_fn(const void *key, Size keysize);
