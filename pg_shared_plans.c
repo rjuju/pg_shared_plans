@@ -14,41 +14,27 @@
 #include "postgres.h"
 
 #include "access/relation.h"
-#include "catalog/index.h"
 #if PG_VERSION_NUM < 130000
 #include "catalog/pg_type_d.h"
 #endif
-#include "commands/dbcommands.h"
 #include "commands/explain.h"
 #if PG_VERSION_NUM >= 130000
 #include "common/hashfn.h"
 #else
 #include "utils/hashutils.h"
 #endif
-#include "executor/spi.h"
-#include "fmgr.h"
-#include "funcapi.h"
-#include "lib/dshash.h"
-#include "miscadmin.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "pgstat.h"
 #include "storage/ipc.h"
-#include "storage/latch.h"
-#include "storage/lmgr.h"
-#include "storage/lwlock.h"
 #include "storage/proc.h"
-#include "storage/shmem.h"
 #if PG_VERSION_NUM >= 130000
 #include "tcop/cmdtag.h"
 #endif
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
-#include "utils/elog.h"
-#include "utils/guc.h"
 #include "utils/lsyscache.h"
-#include "utils/memutils.h"
 #include "utils/syscache.h"
 #if PG_VERSION_NUM < 140000
 #include "utils/timestamp.h"

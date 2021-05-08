@@ -18,9 +18,7 @@
 #include "catalog/indexing.h"
 #endif
 #include "catalog/pg_inherits.h"
-#include "nodes/pg_list.h"
 #include "utils/fmgroids.h"
-#include "utils/relcache.h"
 
 #include "include/pgsp_import.h"
 #include "include/pgsp_inherit.h"
