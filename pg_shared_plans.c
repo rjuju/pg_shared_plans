@@ -439,11 +439,11 @@ pgsp_planner_hook(Query *parse,
 	key.dbid = MyDatabaseId;
 	key.queryid = parse->queryId;
 
-	/* Found unhandled nodes, don't try to cache the plan. */
 	context.constid = 0;
 	context.num_const = 0;
+
 	/*
-	 * Ignore if then plan is not cacheable (e.g. contains a temp table
+	 * Ignore if the plan is not cacheable (e.g. contains a temp table
 	 * reference)
 	 */
 	if (pgsp_query_walker((Node *) parse, &context))
@@ -1188,13 +1188,17 @@ free_rels:
 }
 
 /*
- * Handle cache eviction.  If dropEntry is false, only discard the plan,
- * otherwise also remove the pgspEntry from pgsp_hash.
+ * Handle cache eviction.  3 mechanism are possible:
+ * - PGSP_DISCARD, which will remove the cached plan but keep the entry
+ * - PGSP_EVICT, which will remove the entry entirely
+ * - PGSP_DISCARD_AND_LOCK/PGSP_UNLOCK, which will remove the cached plan, keep
+ *   the entry but also temporarily lock the entry to prevent concurrent usage.
+ *   This is needed for the UTILITY that have a CONCURRENTLY form
  */
 void
-pgsp_evict_by_oid(Oid dbid, Oid classid, Oid relid, pgspEvictionKind kind)
+pgsp_evict_by_oid(Oid dbid, Oid classid, Oid oid, pgspEvictionKind kind)
 {
-	pgspRdependKey		rkey = {dbid, classid, relid};
+	pgspRdependKey		rkey = {dbid, classid, oid};
 	pgspRdependEntry   *rentry;
 	pgspHashKey		   *rkeys;
 	size_t				size;
