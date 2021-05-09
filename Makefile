@@ -1,7 +1,6 @@
 EXTENSION    = pg_shared_plans
 EXTVERSION   = $(shell grep default_version $(EXTENSION).control | sed -e "s/default_version[[:space:]]*=[[:space:]]*'\([^']*\)'/\1/")
-TESTS        = $(wildcard test/sql/*.sql)
-REGRESS      = $(patsubst test/sql/%.sql,%,$(TESTS))
+REGRESS      = 00_setup 01_general 02_advanced 10_index 20_partition
 
 REGRESS_OPTS = --inputdir=test
 
@@ -30,6 +29,22 @@ release-zip: all
 DATA = $(wildcard *--*.sql)
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+ifneq ($(MAJORVERSION),$(filter $(MAJORVERSION), 12 13))
+	REGRESS += 21_pg14_partition
+endif
+
+REGRESS += 30_inheritance
+
+ifneq ($(MAJORVERSION),$(filter $(MAJORVERSION), 12))
+	REGRESS += 40_pg13_withties
+endif
+
+ifneq ($(MAJORVERSION),$(filter $(MAJORVERSION), 12 13))
+	REGRESS += 41_pg14_groupdistinct
+endif
+
+REGRESS += 99_cleanup
 
 DEBUILD_ROOT = /tmp/$(EXTENSION)
 

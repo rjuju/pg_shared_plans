@@ -1,0 +1,74 @@
+PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1;
+PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1;
+PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1;
+PREPARE part_list_1_2(int) AS SELECT id1 FROM part_list_1_2 WHERE id1 = $1;
+-- Should only discard plans depending on part_list_1 and part_list
+ALTER TABLE part_list_1 DETACH PARTITION part_list_1_1 CONCURRENTLY;
+EXECUTE part_list(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_1(1);
+ id1 
+-----
+(0 rows)
+
+EXECUTE part_list_1_2(1);
+ id1 
+-----
+(0 rows)
+
+SELECT 't10' t, bypass, discard, query, relation
+FROM ( SELECT *, unnest(relations)::regclass::text AS relation
+       FROM pg_shared_plans_relations WHERE query LIKE '%part_list%') s
+ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
+  t  | bypass | discard |                                   query                                    |   relation    
+-----+--------+---------+----------------------------------------------------------------------------+---------------
+ t10 |      2 |       9 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t10 |      2 |       8 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t10 |      5 |       4 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
+ t10 |      5 |       0 | PREPARE part_list_1_2(int) AS SELECT id1 FROM part_list_1_2 WHERE id1 = $1 | part_list_1_2
+(4 rows)
+
+ALTER TABLE part_list_1 ATTACH PARTITION part_list_1_1 FOR VALUES IN (1);
+INSERT INTO part_list SELECT 1, 2;
+PREPARE select_part_1(int) AS SELECT * FROM part_list WHERE id1 <= $1;
+-- pg_stat_statements will generate the same queryid for this query, make sure
+-- we see it as a different one
+PREPARE select_part_2(int) AS SELECT * FROM ONLY part_list WHERE id1 <= $1;
+EXECUTE select_part_1(1);
+ id1 | id2 
+-----+-----
+   1 |   2
+(1 row)
+
+EXECUTE select_part_1(1);
+ id1 | id2 
+-----+-----
+   1 |   2
+(1 row)
+
+EXECUTE select_part_2(1);
+ id1 | id2 
+-----+-----
+(0 rows)
+
+EXECUTE select_part_2(1);
+ id1 | id2 
+-----+-----
+(0 rows)
+
+-- We should see 2 entries, each having bypassed the planner once
+SELECT 't11' t, bypass FROM pg_shared_plans WHERE query LIKE '%id1 <=%';
+  t  | bypass 
+-----+--------
+ t11 |      1
+ t11 |      1
+(2 rows)
+
