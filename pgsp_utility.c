@@ -298,13 +298,9 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 					Node *object = lfirst(cell);
 					Oid oid = LookupFuncWithArgs(drop->removeType,
 							castNode(ObjectWithArgs, object), true);
-					uint32				hashValue;
 
 					if (OidIsValid(oid))
-					{
-						hashValue = GetSysCacheHashValue1(PROCOID, ObjectIdGetDatum(oid));
-						remove_oid(PROCOID, hashValue, c);
-					}
+						remove_oid(PROCOID, oid, c);
 				}
 				break;
 			default:
@@ -519,10 +515,9 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 		if (HeapTupleIsValid(tup))
 		{
 			Form_pg_proc oldproc = (Form_pg_proc) GETSTRUCT(tup);
-			uint32		hashValue;
 
-			hashValue = GetSysCacheHashValue1(PROCOID, ObjectIdGetDatum(oldproc->oid));
-			discard_oid(PROCOID, hashValue, c);
+			Assert(OidIsValid(oldproc->oid));
+			discard_oid(PROCOID, oldproc->oid, c);
 
 			ReleaseSysCache(tup);
 		}
@@ -659,21 +654,13 @@ pgsp_utility_post_exec(Node *parsetree, pgspUtilityContext *c)
 		AlterDomainStmt	   *atd = (AlterDomainStmt *) parsetree;
 		TypeName		   *typename;
 		Oid					domainoid;
-		uint32				hashValue;
 
 		/* Make a TypeName so we can use standard type lookup machinery */
 		typename = makeTypeNameFromNameList(atd->typeName);
 		domainoid = typenameTypeId(NULL, typename);
 
 		Assert(OidIsValid(domainoid));
-
-		/*
-		 * Saved type dependencies are done using standard PlanInvalItem
-		 * infrastructure which doesn't track the oid but its hash value, so we
-		 * have to discard plans using the same hash value.
-		 */
-		hashValue = GetSysCacheHashValue1(TYPEOID, ObjectIdGetDatum(domainoid));
-		discard_oid(TYPEOID, hashValue, c);
+		discard_oid(TYPEOID, domainoid, c);
 	}
 	else if (IsA(parsetree, AlterFunctionStmt))
 	{
@@ -683,12 +670,6 @@ pgsp_utility_post_exec(Node *parsetree, pgspUtilityContext *c)
 		funcOid = LookupFuncWithArgs(stmt->objtype, stmt->func, false);
 
 		if (OidIsValid(funcOid))
-		{
-			uint32				hashValue;
-
-			hashValue = GetSysCacheHashValue1(PROCOID,
-											  ObjectIdGetDatum(funcOid));
-			discard_oid(PROCOID, hashValue, c);
-		}
+			discard_oid(PROCOID, funcOid, c);
 	}
 }

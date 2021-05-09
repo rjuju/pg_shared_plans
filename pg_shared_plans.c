@@ -1211,6 +1211,28 @@ pgsp_evict_by_oid(Oid dbid, Oid classid, Oid oid, pgspEvictionKind kind)
 
 	Assert(pgsp_area != NULL);
 
+	/*
+	 * For non-rel reverse dependencies, we previously saved a hash rather than
+	 * the oid as we get the value from PlanInvanItem infrastructure populated
+	 * during planning.
+	 */
+	if (classid != RELOID)
+	{
+		switch (classid)
+		{
+			case TYPEOID:
+				rkey.oid = GetSysCacheHashValue1(TYPEOID,
+						ObjectIdGetDatum(oid));
+				break;
+			case PROCOID:
+				rkey.oid = GetSysCacheHashValue1(PROCOID,
+						ObjectIdGetDatum(oid));
+				break;
+			default:
+				elog(ERROR, "rdepend classid %d not handled", classid);
+		}
+	}
+
 	rentry = dshash_find(pgsp_rdepend, &rkey, true);
 
 	if(!rentry)

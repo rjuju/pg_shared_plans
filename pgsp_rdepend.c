@@ -218,12 +218,14 @@ pgsp_get_rdep_name(Oid classid, Oid oid, char **deptype, char **depname)
 			ReleaseSysCache(tp);
 		}
 		else
-			*depname = "<null>";
+			*depname = "<unknown>";
 		*deptype = "type";
 	}
 	else if (classid == PROCOID)
 	{
 		*depname = get_func_name(oid);
+		if (!*depname)
+			*depname = "<unknown";
 		*deptype = "routine";
 	}
 	else
