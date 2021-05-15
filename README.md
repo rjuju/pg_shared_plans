@@ -26,6 +26,11 @@ Installation
 - `sudo make install`
 - add pg_shared_plans and pg_stat_statements in shared_preload_libraries
 - restart PostgreSQL
+- optionally, create the extension in the wanted database(s):
+
+```
+CREATE EXTENSION pg_shared_plans CASCADE;
+```
 
 Configuration
 -------------
@@ -78,6 +83,7 @@ Example
 -------
 
 ```
+rjuju=# CREATE EXTENSION pg_shared_plans CASCADE;
 rjuju=# SET pg_shared_plans.threshold = 1;
 rjuju=# SET pg_shared_plans.min_plan_time = '0ms';
 rjuju=# SELECT pg_shared_plans_reset();
