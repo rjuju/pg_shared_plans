@@ -101,11 +101,14 @@ static bool pgsp_cache_all;
 static bool pgsp_enabled;
 static int	pgsp_max;
 static int	pgsp_min_plantime;
+extern int	pgsp_rdepend_max;
 static bool	pgsp_ro;
 static int	pgsp_threshold;
 static bool pgsp_es_costs;
 static int	pgsp_es_format;
 static bool pgsp_es_verbose;
+
+static void pgsp_assign_rdepend_max(int newval, void *extra);
 
 static const struct config_enum_entry pgsp_explain_format_options[] =
 {
@@ -264,6 +267,19 @@ _PG_init(void)
 							NULL,
 							NULL);
 
+	DefineCustomIntVariable("pg_shared_plans.rdepend_max",
+							"Sets the maximum number of entries to store per reverse dependency.",
+							NULL,
+							&pgsp_rdepend_max,
+							50,
+							PGSP_RDEPEND_INIT,
+							10000,
+							PGC_SIGHUP,
+							0,
+							NULL,
+							pgsp_assign_rdepend_max,
+							NULL);
+
 	DefineCustomBoolVariable("pg_shared_plans.explain_costs",
 							 "Display plans with COST option.",
 							 NULL,
@@ -326,6 +342,15 @@ _PG_fini(void)
 	planner_hook = prev_planner_hook;
 	ProcessUtility_hook = prev_ProcessUtility;
 
+}
+
+static void
+pgsp_assign_rdepend_max(int newval, void *extra)
+{
+	if (newval < pgsp_rdepend_max)
+		elog(WARNING, "New value for pg_shared_plans.rdepend_max (%d)"
+				" is lower than the previous value (%d). Existing entries"
+				" won't be affected.", newval, pgsp_rdepend_max);
 }
 
 /*
@@ -2062,8 +2087,6 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 				LWLockRelease(pgsp->lock);
 				SRF_RETURN_DONE(fctx);
 			}
-
-			Assert(rentry->num_keys <= PGSP_RDEPEND_MAX);
 
 			fctx->max_calls = rentry->num_keys;
 			rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);

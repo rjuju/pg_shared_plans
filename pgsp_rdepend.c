@@ -28,6 +28,8 @@
 
 #include "include/pgsp_rdepend.h"
 
+int pgsp_rdepend_max;
+
 static void pgsp_get_rdep_name(Oid classid, Oid oid, char **deptype,
 		char **depname);
 
@@ -77,23 +79,25 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 	{
 		dsa_pointer new_rkeys_p;
 		pgspHashKey *new_rkeys;
-		int new_max_keys = Max(rentry->max_keys * 2, PGSP_RDEPEND_MAX);
+		int new_max_keys = Max(rentry->max_keys * 2, pgsp_rdepend_max);
 
 		/*
 		 * Too many rdepend entries for this object, refuse to create a new
 		 * pgspEntry and raise a WARNING.
-		 * XXX should PGSP_RDEPEND_MAX be exposed as a GUC?
 		 */
-		if (rentry->num_keys >= PGSP_RDEPEND_MAX)
+		if (rentry->num_keys >= pgsp_rdepend_max)
 		{
 			char *deptype;
 			char *depname;
 
 			pgsp_get_rdep_name(classid, oid, &deptype, &depname);
 
-			elog(WARNING, "pgsp: Too many cache entries for %s \"%s\""
+			ereport(WARNING,
+					(errmsg("pgsp: Too many cache entries for %s \"%s\""
 					" on database \"%s\"",
-					deptype, depname, get_database_name(dbid));
+					deptype, depname, get_database_name(dbid))),
+					errhint("You might want to increase"
+						" pg_shared_plans.rdepend_max"));
 
 			dshash_release_lock(pgsp_rdepend, rentry);
 			return false;

@@ -35,6 +35,8 @@ The following configuration options are available:
 - pg_shared_plans.enabled: Enable or disable pg_shared_plans (default: on)
 - pg_shared_plans.max: Maximum number of plans to cache in shared memory
   (default: 200)
+- pg_shared_plans.rdepend_max: Maximum number of entries to store per reverse
+  dendency (default: 50)
 - pg_shared_plans.min_plan_time: Minimum planning time for a plans to be cached
   in shared memory (default: 10ms)
 - pg_shared_plans.threshold: Minimum number of custom plans to generate before

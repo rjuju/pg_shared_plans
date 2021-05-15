@@ -24,7 +24,6 @@
 
 
 #define PGSP_RDEPEND_INIT		10		/* default rdepend entry array size */
-#define PGSP_RDEPEND_MAX		5160		/* max rdepend entry array size */
 
 typedef struct pgspRdependKey
 {
