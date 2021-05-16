@@ -1727,16 +1727,18 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 				}
 			}
 
+#if PG_VERSION_NUM < 140000
 			/*
 			 * pg_stat_statements doesn't take into account inheritance query
-			 * (FROM ONLY ... / FROM ... *)
+			 * (FROM ONLY ... / FROM ... *) before pg14.
 			 */
 			context->constid = hash_combine(context->constid, rte->inh);
+#endif
 
-#if PG_VERSION_NUM >= 130000
+#if PG_VERSION_NUM >= 130000 && PG_VERSION_NUM < 140000
 			/*
 			 * pg_stat_statements doesn't take into account the limit option
-			 * (ONLY / WITH TIES).
+			 * (ONLY / WITH TIES) before pg14.
 			 */
 			context->constid = hash_combine(context->constid,
 											query->limitOption);
@@ -1761,11 +1763,6 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 				}
 			}
 		}
-
-#if PG_VERSION_NUM >= 140000
-		/* pg_stat_statements doesn't take into account groupDistinct */
-		context->constid = hash_combine(context->constid, query->groupDistinct);
-#endif
 
 		/*
 		 * pg_stat_statements doesn't take into account the alias colnames,
@@ -1812,13 +1809,17 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 		if (aclresult != ACLCHECK_OK)
 			return true;
 	}
+#if PG_VERSION_NUM < 140000
 	else if (IsA(node, GroupingFunc))
 	{
 		GroupingFunc *gf = (GroupingFunc *) node;
 
-		/* pg_stat_statement doesn't take into account agglevelsup */
+		/*
+		 * pg_stat_statement doesn't take into account agglevelsup until pg14.
+		 */
 		context->constid = hash_combine(context->constid, gf->agglevelsup);
 	}
+#endif
 	else if (IsA(node, XmlExpr))
 	{
 		XmlExpr *expr = (XmlExpr *) node;
