@@ -433,7 +433,7 @@ pgsp_planner_hook(Query *parse,
 				  int cursorOptions,
 				  ParamListInfo boundParams)
 {
-	Query		   *generic_parse, *back_parse;
+	Query		   *generic_parse = NULL, *back_parse = NULL;
 	PlannedStmt	   *result, *generic;
 	pgspHashKey		key;
 	pgspEntry	   *entry;
@@ -634,6 +634,7 @@ pgsp_planner_hook(Query *parse,
 	/* Save the plan if no one did it yet */
 	if (!entry && plantime >= pgsp_min_plantime)
 	{
+		Assert(back_parse != NULL && generic_parse != NULL);
 		/* Generate a generic plan */
 		generic = standard_planner(generic_parse,
 #if PG_VERSION_NUM >= 130000
