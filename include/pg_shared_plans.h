@@ -70,6 +70,8 @@ typedef struct pgspSharedState
 	dsa_handle	pgsp_dsa_handle;
 	dshash_table_handle pgsp_rdepend_handle;
 	double		cur_median_usage;	/* current median usage in hashtable */
+	int			rdepend_num;		/* # of entried in the rdepend dshash */
+	Size		rdepend_size;		/* allocated size for rdepend entries */
 	slock_t		mutex;				/* protects following fields only */
 	int64		dealloc;			/* # of times entries were deallocated */
 	TimestampTz stats_reset;		/* timestamp with all stats reset */

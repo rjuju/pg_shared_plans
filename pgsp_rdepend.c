@@ -17,6 +17,7 @@
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "storage/lwlock.h"
+#include "storage/shmem.h"
 #if PG_VERSION_NUM >= 130000
 #include "common/hashfn.h"
 #else
@@ -27,6 +28,8 @@
 #include "utils/syscache.h"
 
 #include "include/pgsp_rdepend.h"
+
+#define RDEPEND_SIZE(nb)	mul_size(sizeof(pgspHashKey), (nb))
 
 int pgsp_rdepend_max;
 
@@ -63,7 +66,7 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 		rentry->max_keys = PGSP_RDEPEND_INIT;
 		rentry->num_keys = 0;
 		rentry->keys = dsa_allocate_extended(pgsp_area,
-				sizeof(pgspHashKey) * PGSP_RDEPEND_INIT,
+				RDEPEND_SIZE(PGSP_RDEPEND_INIT),
 				DSA_ALLOC_NO_OOM);
 
 		if (rentry->keys == InvalidDsaPointer)
@@ -72,6 +75,9 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 
 			return false;
 		}
+		pgsp->rdepend_num++;
+		pgsp->rdepend_size = add_size(pgsp->rdepend_size,
+									  RDEPEND_SIZE(PGSP_RDEPEND_INIT));
 	}
 	Assert(rentry->keys != InvalidDsaPointer);
 
@@ -80,6 +86,9 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 		dsa_pointer new_rkeys_p;
 		pgspHashKey *new_rkeys;
 		int new_max_keys = Max(rentry->max_keys * 2, pgsp_rdepend_max);
+
+		Assert(found);
+		Assert(pgsp->rdepend_size >= RDEPEND_SIZE(rentry->max_keys));
 
 		/*
 		 * Too many rdepend entries for this object, refuse to create a new
@@ -106,6 +115,11 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 		rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
 		Assert(rkeys != NULL);
 
+		/*
+		 * The area is pinned, so we can't process an interrupt here as we
+		 * could otherwise leak memory permanently.
+		 */
+		HOLD_INTERRUPTS();
 		new_rkeys_p = dsa_allocate_extended(pgsp_area,
 											sizeof(pgspHashKey) * new_max_keys,
 											DSA_ALLOC_NO_OOM);
@@ -121,8 +135,12 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 					deptype, depname, get_database_name(dbid));
 
 			dshash_release_lock(pgsp_rdepend, rentry);
+			RESUME_INTERRUPTS();
 			return false;
 		}
+
+		pgsp->rdepend_size = add_size(pgsp->rdepend_size,
+								RDEPEND_SIZE(new_max_keys - rentry->max_keys));
 
 		new_rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, new_rkeys_p);
 		Assert(new_rkeys != NULL);
@@ -133,6 +151,8 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 
 		rentry->keys = new_rkeys_p;
 		rentry->max_keys = new_max_keys;
+
+		RESUME_INTERRUPTS();
 	}
 
 	rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
@@ -182,6 +202,12 @@ pgsp_entry_unregister_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 
 	Assert(rentry->keys != InvalidDsaPointer);
 
+	/* We might end up removing the rdepend entry, so we can't process
+	 * interrupts here as we could otherwise permanently leak memory
+	 * permanently.
+	 */
+	HOLD_INTERRUPTS();
+
 	rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
 	for(delidx = 0; delidx < rentry->num_keys; delidx++)
 	{
@@ -200,6 +226,8 @@ pgsp_entry_unregister_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 	}
 
 	dshash_release_lock(pgsp_rdepend, rentry);
+
+	RESUME_INTERRUPTS();
 }
 
 static void

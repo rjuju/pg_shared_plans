@@ -388,6 +388,8 @@ pgsp_shmem_startup(void)
 		pgsp->pgsp_dsa_handle = DSM_HANDLE_INVALID;
 		pgsp->pgsp_rdepend_handle = InvalidDsaPointer;
 		pgsp->cur_median_usage = ASSUMED_MEDIAN_INIT;
+		pgsp->rdepend_num = 0;
+		pgsp->rdepend_size = 0;
 		SpinLockInit(&pgsp->mutex);
 
 		/* try to guess our trancheid */
