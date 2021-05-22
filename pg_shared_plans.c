@@ -1528,19 +1528,38 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 		lockers = pg_atomic_read_u32(&entry->lockers);
 		if (lockers != 0)
 		{
-			Oid	   *array = NULL;
+			Oid			   *array = NULL;
+			pgspRdependKey *rdeps = NULL;
 			int		i;
 
 			/* Free the plan. */
 			dsa_free(pgsp_area, context->plan);
 
-			array = dsa_get_address(pgsp_area, context->rels);
-			Assert(array != NULL);
-
 			/* Free all saved rdepend. */
-			for (i = 0; i < context->num_rels; i++)
-				pgsp_entry_unregister_rdepend(MyDatabaseId, RELOID, array[i],
-											  key);
+			if (context->num_rels > 0)
+			{
+				array = dsa_get_address(pgsp_area, context->rels);
+				Assert(array != NULL);
+
+				for (i = 0; i < context->num_rels; i++)
+					pgsp_entry_unregister_rdepend(MyDatabaseId, RELOID,
+												  array[i], key);
+			}
+
+			if (context->num_rdeps > 0)
+			{
+				rdeps = dsa_get_address(pgsp_area, context->rdeps);
+				Assert(rdeps != NULL);
+
+				for (i = 0; i < context->num_rels; i++)
+				{
+					Assert(rdeps[i].dbid == MyDatabaseId);
+					pgsp_entry_unregister_rdepend(rdeps[i].dbid,
+												  rdeps[i].classid,
+												  rdeps[i].oid,
+												  key);
+				}
+			}
 
 			/* And free the array of Oid. */
 			dsa_free(pgsp_area, context->rels);
@@ -1548,6 +1567,8 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 		else
 			entry->plan = context->plan;
 	}
+
+	Assert(entry->num_rels == context->num_rels);
 
 	/* We should always have a valid handle */
 	Assert(entry->plan != InvalidDsaPointer || lockers > 0);
