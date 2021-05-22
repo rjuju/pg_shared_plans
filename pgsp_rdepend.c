@@ -46,7 +46,7 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 	pgspRdependKey rkey = {dbid, classid, oid};
 	pgspRdependEntry   *rentry;
 	pgspHashKey			*rkeys;
-	bool				found;
+	bool				found, dsfound;
 	int					i;
 
 	/* Note that even though we hold an exlusive lock on pgsp->lock, it will
@@ -59,9 +59,9 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 	if (classid != RELOID && classid != TYPEOID && classid != PROCOID)
 		elog(ERROR, "pgsp: rdepend classid %d not handled", classid);
 
-	rentry = dshash_find_or_insert(pgsp_rdepend, &rkey, &found);
+	rentry = dshash_find_or_insert(pgsp_rdepend, &rkey, &dsfound);
 
-	if (!found)
+	if (!dsfound)
 	{
 		volatile pgspSharedState *s = (volatile pgspSharedState *) pgsp;
 
@@ -99,8 +99,7 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 		SpinLockRelease(&s->mutex);
 #endif
 
-		Assert(found);
-		Assert(pgsp->rdepend_size >= RDEPEND_SIZE(rentry->max_keys));
+		Assert(dsfound);
 
 		/*
 		 * Too many rdepend entries for this object, refuse to create a new
@@ -177,12 +176,29 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 		if (pgsp_match_fn(key, &(rkeys[i]), 0) == 0)
 		{
 			found = true;
+#if defined(USE_ASSERT_CHECKING)
+			continue;
+#else
 			break;
+#endif
 		}
+#if defined(USE_ASSERT_CHECKING)
+		Assert(pgsp_match_fn(key, &(rkeys[i]), 0) != 0);
+#endif
 	}
 
 	if (!found)
 		rkeys[rentry->num_keys++] = *key;
+	else
+	{
+		Assert(dsfound);
+	}
+
+	/* Just extra safety check. */
+	if(!dsfound)
+	{
+		Assert(!found);
+	}
 
 	dshash_release_lock(pgsp_rdepend, rentry);
 
@@ -230,11 +246,19 @@ pgsp_entry_unregister_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 			for (pos = delidx + 1; pos < rentry->num_keys; pos++)
 				rkeys[pos - 1] = rkeys[pos];
 
+			Assert(rentry->num_keys > 0);
 			rentry->num_keys--;
 
+#if defined(USE_ASSERT_CHECKING)
+			continue;
+#else
 			/* We should not register duplicated rdpend entries. */
 			break;
+#endif
 		}
+#if defined(USE_ASSERT_CHECKING)
+		Assert(pgsp_match_fn(key, &(rkeys[delidx]), 0) != 0);
+#endif
 	}
 
 	if (rentry->num_keys == 0)

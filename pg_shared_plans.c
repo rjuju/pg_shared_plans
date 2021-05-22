@@ -1561,14 +1561,18 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 				}
 			}
 
-			/* And free the array of Oid. */
-			dsa_free(pgsp_area, context->rels);
+			/* And free the rdepend arrays. */
+			if (context->num_rels > 0)
+				dsa_free(pgsp_area, context->rels);
+			if (context->num_rdeps > 0)
+				dsa_free(pgsp_area, context->rdeps);
 		}
 		else
 			entry->plan = context->plan;
 	}
 
 	Assert(entry->num_rels == context->num_rels);
+	Assert(entry->num_rdeps == context->num_rdeps);
 
 	/* We should always have a valid handle */
 	Assert(entry->plan != InvalidDsaPointer || lockers > 0);
