@@ -1486,6 +1486,8 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 	Assert(context->plan != InvalidDsaPointer);
 	Assert((context->num_rels == 0 && context->rels == InvalidDsaPointer) ||
 		   (context->num_rels > 0 && context->rels != InvalidDsaPointer));
+	Assert((context->num_rdeps == 0 && context->rdeps == InvalidDsaPointer) ||
+		   (context->num_rdeps > 0 && context->rdeps != InvalidDsaPointer));
 
 	/* Make space if needed */
 	while (hash_get_num_entries(pgsp_hash) >= pgsp_max)
@@ -1950,7 +1952,7 @@ pg_shared_plans_reset(PG_FUNCTION_ARGS)
 }
 
 /* Number of output arguments (columns) for pg_shared_plans_info */
-#define PG_SHARED_PLANS_INFO_COLS	2
+#define PG_SHARED_PLANS_INFO_COLS	4
 
 /*
  * Return statistics of pg_shared_plans.
@@ -1977,10 +1979,13 @@ pg_shared_plans_info(PG_FUNCTION_ARGS)
 	/* Read global statistics for pg_shared_plans */
 	{
 		volatile pgspSharedState *s = (volatile pgspSharedState *) pgsp;
+		int i = 0;
 
 		SpinLockAcquire(&s->mutex);
-		values[0] = Int64GetDatum(s->dealloc);
-		values[1] = TimestampTzGetDatum(s->stats_reset);
+		values[i++] = Int32GetDatum(s->rdepend_num);
+		values[i++] = Int64GetDatum(s->rdepend_size);
+		values[i++] = Int64GetDatum(s->dealloc);
+		values[i++] = TimestampTzGetDatum(s->stats_reset);
 		SpinLockRelease(&s->mutex);
 	}
 
