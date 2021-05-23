@@ -65,9 +65,10 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
  t  | bypass | discard |                            query                             | relation 
 ----+--------+---------+--------------------------------------------------------------+----------
  t2 |      1 |       1 | PREPARE inh_a(int) AS SELECT * FROM inh_a WHERE id1 = $1     | inh_a
+ t2 |      1 |       1 | PREPARE inh_a(int) AS SELECT * FROM inh_a WHERE id1 = $1     | inh_a_1
  t2 |      1 |       0 | PREPARE inh_a_1(int) AS SELECT * FROM inh_a_1 WHERE id1 = $1 | inh_a_1
  t2 |      1 |       0 | PREPARE inh_b(int) AS SELECT * FROM inh_b WHERE id2 = $1     | inh_b
-(3 rows)
+(4 rows)
 
 CREATE TABLE inh_a_1_b() INHERITS (inh_a_1, inh_b);
 PREPARE inh_a_1_b(int) AS SELECT * FROM inh_a_1_b WHERE id1 = $1;
@@ -104,10 +105,14 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
  t  | bypass | discard |                              query                               | relation  
 ----+--------+---------+------------------------------------------------------------------+-----------
  t3 |      1 |       2 | PREPARE inh_a(int) AS SELECT * FROM inh_a WHERE id1 = $1         | inh_a
+ t3 |      1 |       2 | PREPARE inh_a(int) AS SELECT * FROM inh_a WHERE id1 = $1         | inh_a_1
+ t3 |      1 |       2 | PREPARE inh_a(int) AS SELECT * FROM inh_a WHERE id1 = $1         | inh_a_1_b
  t3 |      1 |       1 | PREPARE inh_a_1(int) AS SELECT * FROM inh_a_1 WHERE id1 = $1     | inh_a_1
+ t3 |      1 |       1 | PREPARE inh_a_1(int) AS SELECT * FROM inh_a_1 WHERE id1 = $1     | inh_a_1_b
  t3 |      1 |       0 | PREPARE inh_a_1_b(int) AS SELECT * FROM inh_a_1_b WHERE id1 = $1 | inh_a_1_b
+ t3 |      1 |       1 | PREPARE inh_b(int) AS SELECT * FROM inh_b WHERE id2 = $1         | inh_a_1_b
  t3 |      1 |       1 | PREPARE inh_b(int) AS SELECT * FROM inh_b WHERE id2 = $1         | inh_b
-(4 rows)
+(8 rows)
 
 CREATE INDEX ON inh_a_1_b(id1);
 -- we need to cache new plans so they can later be discarded
@@ -138,10 +143,14 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
  t  | bypass | discard |                              query                               | relation  
 ----+--------+---------+------------------------------------------------------------------+-----------
  t4 |      1 |       3 | PREPARE inh_a(int) AS SELECT * FROM inh_a WHERE id1 = $1         | inh_a
+ t4 |      1 |       3 | PREPARE inh_a(int) AS SELECT * FROM inh_a WHERE id1 = $1         | inh_a_1
+ t4 |      1 |       3 | PREPARE inh_a(int) AS SELECT * FROM inh_a WHERE id1 = $1         | inh_a_1_b
  t4 |      1 |       2 | PREPARE inh_a_1(int) AS SELECT * FROM inh_a_1 WHERE id1 = $1     | inh_a_1
+ t4 |      1 |       2 | PREPARE inh_a_1(int) AS SELECT * FROM inh_a_1 WHERE id1 = $1     | inh_a_1_b
  t4 |      1 |       1 | PREPARE inh_a_1_b(int) AS SELECT * FROM inh_a_1_b WHERE id1 = $1 | inh_a_1_b
+ t4 |      1 |       2 | PREPARE inh_b(int) AS SELECT * FROM inh_b WHERE id2 = $1         | inh_a_1_b
  t4 |      1 |       2 | PREPARE inh_b(int) AS SELECT * FROM inh_b WHERE id2 = $1         | inh_b
-(4 rows)
+(8 rows)
 
 CREATE INDEX ON inh_a(id1);
 SELECT 't5' t, bypass, discard, query, relation
@@ -151,10 +160,14 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
  t  | bypass | discard |                              query                               | relation  
 ----+--------+---------+------------------------------------------------------------------+-----------
  t5 |      1 |       4 | PREPARE inh_a(int) AS SELECT * FROM inh_a WHERE id1 = $1         | inh_a
+ t5 |      1 |       4 | PREPARE inh_a(int) AS SELECT * FROM inh_a WHERE id1 = $1         | inh_a_1
+ t5 |      1 |       4 | PREPARE inh_a(int) AS SELECT * FROM inh_a WHERE id1 = $1         | inh_a_1_b
  t5 |      1 |       2 | PREPARE inh_a_1(int) AS SELECT * FROM inh_a_1 WHERE id1 = $1     | inh_a_1
+ t5 |      1 |       2 | PREPARE inh_a_1(int) AS SELECT * FROM inh_a_1 WHERE id1 = $1     | inh_a_1_b
  t5 |      1 |       1 | PREPARE inh_a_1_b(int) AS SELECT * FROM inh_a_1_b WHERE id1 = $1 | inh_a_1_b
+ t5 |      1 |       2 | PREPARE inh_b(int) AS SELECT * FROM inh_b WHERE id2 = $1         | inh_a_1_b
  t5 |      1 |       2 | PREPARE inh_b(int) AS SELECT * FROM inh_b WHERE id2 = $1         | inh_b
-(4 rows)
+(8 rows)
 
 INSERT INTO inh_a_1 SELECT 1;
 PREPARE select_inh_1(int) AS SELECT * FROM inh_a WHERE id1 <= $1;

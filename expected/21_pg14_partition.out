@@ -31,10 +31,11 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
   t  | bypass | discard |                                   query                                    |   relation    
 -----+--------+---------+----------------------------------------------------------------------------+---------------
  t10 |      2 |       9 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t10 |      2 |       9 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1
  t10 |      2 |       8 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
  t10 |      5 |       4 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
  t10 |      5 |       0 | PREPARE part_list_1_2(int) AS SELECT id1 FROM part_list_1_2 WHERE id1 = $1 | part_list_1_2
-(4 rows)
+(5 rows)
 
 ALTER TABLE part_list_1 ATTACH PARTITION part_list_1_1 FOR VALUES IN (1);
 INSERT INTO part_list SELECT 1, 2;

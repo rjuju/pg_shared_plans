@@ -1404,13 +1404,17 @@ pgsp_cache_plan(Query *parse, PlannedStmt *custom, PlannedStmt *generic,
 	/*
 	 * We store the plan is shared memory before acquiring the lwlock.  It
 	 * means that we may have to free it, but it avoids locking overhead.
+	 * We don't allow interrupts here as we could otherwise leak memory
+	 * permanently.
 	 */
+	HOLD_INTERRUPTS();
 	if (!pgsp_allocate_plan(parse, generic, &context, key))
 	{
 		/*
 		 * Don't try to allocate a new entry if we couldn't store the plan in
 		 * shared memory.
 		 */
+		RESUME_INTERRUPTS();
 		return;
 	}
 
@@ -1420,6 +1424,7 @@ pgsp_cache_plan(Query *parse, PlannedStmt *custom, PlannedStmt *generic,
 							 pgsp_cached_plan_cost(generic, false));
 	Assert(entry);
 	LWLockRelease(pgsp->lock);
+	RESUME_INTERRUPTS();
 }
 
 /* Calculate a hash value for a given key. */
@@ -1571,10 +1576,105 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 			entry->plan = context->plan;
 	}
 
+	/* Update reverse dependencies */
+	if (found && entry->plan != InvalidDsaPointer)
+	{
+		if (entry->rels != InvalidDsaPointer)
+		{
+			Oid *old = dsa_get_address(pgsp_area, entry->rels);
+			Oid *new = NULL;
+			int i;
+
+			Assert(entry->num_rels > 0);
+
+			if (context->rels != InvalidDsaPointer)
+			{
+				Assert(context->num_rels > 0);
+				new = dsa_get_address(pgsp_area, context->rels);
+			}
+			else
+			{
+				Assert(context->num_rels == 0);
+			}
+
+			/* Remove rels that are no longer referenced */
+			for (i = 0; i < entry->num_rels; i++)
+			{
+				int j;
+				bool rel_found = false;
+
+				for (j = 0; j < context->num_rels; j++)
+				{
+					if (old[i] == new[j])
+					{
+						rel_found = true;
+						break;
+					}
+				}
+
+				if (!rel_found)
+				{
+					pgsp_entry_unregister_rdepend(MyDatabaseId, RELOID,
+												  old[i], key);
+				}
+			}
+			dsa_free(pgsp_area, entry->rels);
+		}
+		entry->rels = context->rels;
+		entry->num_rels = context->num_rels;
+
+		if (entry->rdeps != InvalidDsaPointer)
+		{
+			pgspRdependKey *old = dsa_get_address(pgsp_area, entry->rdeps);
+			pgspRdependKey *new = NULL;
+			int i;
+
+			Assert(entry->num_rdeps > 0);
+
+			if (context->rdeps != InvalidDsaPointer)
+			{
+				Assert(context->num_rdeps > 0);
+				new = dsa_get_address(pgsp_area, context->rdeps);
+			}
+			else
+			{
+				Assert(context->num_rdeps == 0);
+			}
+
+			/* Remove rdeps that are no longer referenced */
+			for (i = 0; i < entry->num_rdeps; i++)
+			{
+				int j;
+				bool rdep_found = false;
+
+				for (j = 0; j < context->num_rdeps; j++)
+				{
+					if (pgsp_rdepend_fn_compare(&old[i], &new[j], 0, NULL) == 0)
+					{
+						rdep_found = true;
+						break;
+					}
+				}
+
+				if (!rdep_found)
+				{
+					Assert(old[i].dbid == MyDatabaseId);
+					pgsp_entry_unregister_rdepend(old[i].dbid,
+												  old[i].classid,
+												  old[i].oid,
+												  key);
+				}
+			}
+			dsa_free(pgsp_area, entry->rdeps);
+		}
+		entry->rdeps = context->rdeps;
+		entry->num_rdeps = context->num_rdeps;
+	}
+
 	Assert(entry->num_rels == context->num_rels);
 	Assert(entry->num_rdeps == context->num_rdeps);
 
-	/* We should always have a valid handle */
+	/* We should always have a valid handle if the entry isn't locked */
 	Assert(entry->plan != InvalidDsaPointer || lockers > 0);
 
 	return entry;

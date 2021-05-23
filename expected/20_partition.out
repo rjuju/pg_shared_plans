@@ -55,8 +55,9 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
  t  | bypass | discard |                                 query                                  |  relation   
 ----+--------+---------+------------------------------------------------------------------------+-------------
  t2 |      1 |       1 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1     | part_list
+ t2 |      1 |       1 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1     | part_list_1
  t2 |      1 |       0 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1 | part_list_1
-(2 rows)
+(3 rows)
 
 CREATE TABLE part_list_1_1 PARTITION OF part_list_1 FOR VALUES IN (1);
 PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1;
@@ -88,9 +89,12 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
  t  | bypass | discard |                                   query                                    |   relation    
 ----+--------+---------+----------------------------------------------------------------------------+---------------
  t3 |      1 |       2 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t3 |      1 |       2 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1
+ t3 |      1 |       2 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1_1
  t3 |      1 |       1 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t3 |      1 |       1 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1_1
  t3 |      1 |       0 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
-(3 rows)
+(6 rows)
 
 CREATE INDEX ON part_list_1_1(id1);
 -- we need to cache new plans so it can later be discarded
@@ -116,9 +120,12 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
  t  | bypass | discard |                                   query                                    |   relation    
 ----+--------+---------+----------------------------------------------------------------------------+---------------
  t4 |      1 |       3 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t4 |      1 |       3 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1
+ t4 |      1 |       3 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1_1
  t4 |      1 |       2 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t4 |      1 |       2 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1_1
  t4 |      1 |       1 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
-(3 rows)
+(6 rows)
 
 BEGIN;
 CREATE INDEX ON part_list(id1);
@@ -146,9 +153,12 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
   t  | bypass | discard |                                   query                                    |   relation    
 -----+--------+---------+----------------------------------------------------------------------------+---------------
  t5a |      1 |       4 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t5a |      1 |       4 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1
+ t5a |      1 |       4 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1_1
  t5a |      1 |       3 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t5a |      1 |       3 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1_1
  t5a |      1 |       2 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
-(3 rows)
+(6 rows)
 
 BEGIN;
 CREATE INDEX ON part_list(id1);
@@ -176,9 +186,12 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
   t  | bypass | discard |                                   query                                    |   relation    
 -----+--------+---------+----------------------------------------------------------------------------+---------------
  t5b |      1 |       5 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t5b |      1 |       5 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1
+ t5b |      1 |       5 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1_1
  t5b |      1 |       4 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t5b |      1 |       4 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1_1
  t5b |      1 |       3 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
-(3 rows)
+(6 rows)
 
 -- should not discard anything
 CREATE TABLE part_list_1_2(id1 integer, id2 integer);
@@ -215,10 +228,13 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
  t  | bypass | discard |                                   query                                    |   relation    
 ----+--------+---------+----------------------------------------------------------------------------+---------------
  t6 |      2 |       5 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t6 |      2 |       5 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1
+ t6 |      2 |       5 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1_1
  t6 |      2 |       4 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t6 |      2 |       4 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1_1
  t6 |      2 |       3 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
  t6 |      1 |       0 | PREPARE part_list_1_2(int) AS SELECT id1 FROM part_list_1_2 WHERE id1 = $1 | part_list_1_2
-(4 rows)
+(7 rows)
 
 -- Should only discard plans depending on part_list_1 and part_list
 ALTER TABLE part_list_1 ATTACH PARTITION part_list_1_2 FOR VALUES IN (2);
@@ -249,10 +265,15 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
  t  | bypass | discard |                                   query                                    |   relation    
 ----+--------+---------+----------------------------------------------------------------------------+---------------
  t7 |      2 |       6 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t7 |      2 |       6 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1
+ t7 |      2 |       6 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1_1
+ t7 |      2 |       6 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1_2
  t7 |      2 |       5 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t7 |      2 |       5 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1_1
+ t7 |      2 |       5 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1_2
  t7 |      3 |       3 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
  t7 |      2 |       0 | PREPARE part_list_1_2(int) AS SELECT id1 FROM part_list_1_2 WHERE id1 = $1 | part_list_1_2
-(4 rows)
+(9 rows)
 
 -- Should only discard plans depending on part_list_1 and part_list
 ALTER TABLE part_list_1 DETACH PARTITION part_list_1_2;
@@ -283,10 +304,13 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
  t  | bypass | discard |                                   query                                    |   relation    
 ----+--------+---------+----------------------------------------------------------------------------+---------------
  t8 |      2 |       7 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t8 |      2 |       7 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1
+ t8 |      2 |       7 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1_1
  t8 |      2 |       6 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t8 |      2 |       6 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1_1
  t8 |      4 |       3 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
  t8 |      3 |       0 | PREPARE part_list_1_2(int) AS SELECT id1 FROM part_list_1_2 WHERE id1 = $1 | part_list_1_2
-(4 rows)
+(7 rows)
 
 -- Should discard all plans depending on still attached partitions
 ALTER TABLE part_list ALTER COLUMN id2 TYPE bigint;
@@ -317,8 +341,11 @@ ORDER BY query COLLATE "C", relation COLLATE "C", bypass, discard;
  t  | bypass | discard |                                   query                                    |   relation    
 ----+--------+---------+----------------------------------------------------------------------------+---------------
  t9 |      2 |       8 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list
+ t9 |      2 |       8 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1
+ t9 |      2 |       8 | PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1         | part_list_1_1
  t9 |      2 |       7 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1
+ t9 |      2 |       7 | PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1     | part_list_1_1
  t9 |      4 |       4 | PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1 | part_list_1_1
  t9 |      4 |       0 | PREPARE part_list_1_2(int) AS SELECT id1 FROM part_list_1_2 WHERE id1 = $1 | part_list_1_2
-(4 rows)
+(7 rows)
 
