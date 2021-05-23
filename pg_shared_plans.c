@@ -1127,7 +1127,7 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 		 * If we couldn't allocate memory for the rels, inform caller but only
 		 * after releasing the plan we just alloc'ed.
 		 */
-		if (context->plan == InvalidDsaPointer)
+		if (context->rels == InvalidDsaPointer)
 		{
 			dsa_free(pgsp_area, context->plan);
 			PGSP_FREEDSMEM(context->len);
