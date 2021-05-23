@@ -2017,7 +2017,7 @@ pg_shared_plans_info(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
 
-#define PG_SHARED_PLANS_COLS			16
+#define PG_SHARED_PLANS_COLS			17
 Datum
 pg_shared_plans(PG_FUNCTION_ARGS)
 {
@@ -2074,6 +2074,8 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "generic_cost",
 						   FLOAT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "num_relations",
+						   INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "num_rdeps",
 						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "discard",
 						   INT8OID, -1, 0);
@@ -2211,6 +2213,7 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		values[i++] = Int64GetDatumFast(num_custom_plans);
 		values[i++] = Float8GetDatumFast(generic_cost);
 		values[i++] = Int32GetDatum(entry->num_rels);
+		values[i++] = Int32GetDatum(entry->num_rdeps);
 		values[i++] = Int64GetDatumFast(discard);
 		values[i++] = UInt32GetDatum(pg_atomic_read_u32(&entry->lockers));
 
