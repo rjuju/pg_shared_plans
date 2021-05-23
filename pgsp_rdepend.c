@@ -29,7 +29,7 @@
 
 #include "include/pgsp_rdepend.h"
 
-#define RDEPEND_SIZE(nb)	mul_size(sizeof(pgspHashKey), (nb))
+#define RDEPEND_KEY_SIZE(nb)	(sizeof(pgspHashKey) * (nb))
 
 int pgsp_rdepend_max;
 
@@ -68,7 +68,7 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 		rentry->max_keys = PGSP_RDEPEND_INIT;
 		rentry->num_keys = 0;
 		rentry->keys = dsa_allocate_extended(pgsp_area,
-				RDEPEND_SIZE(PGSP_RDEPEND_INIT),
+				RDEPEND_KEY_SIZE(PGSP_RDEPEND_INIT),
 				DSA_ALLOC_NO_OOM);
 
 		if (rentry->keys == InvalidDsaPointer)
@@ -80,8 +80,7 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 
 		SpinLockAcquire(&s->mutex);
 		s->rdepend_num++;
-		s->rdepend_size = add_size(pgsp->rdepend_size,
-								   RDEPEND_SIZE(PGSP_RDEPEND_INIT));
+		s->alloced_size += RDEPEND_KEY_SIZE(PGSP_RDEPEND_INIT);
 		SpinLockRelease(&s->mutex);
 	}
 	Assert(rentry->keys != InvalidDsaPointer);
@@ -91,13 +90,11 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 		dsa_pointer new_rkeys_p;
 		pgspHashKey *new_rkeys;
 		int new_max_keys = Max(rentry->max_keys * 2, pgsp_rdepend_max);
-#if defined(USE_ASSERT_CHECKING)
 		volatile pgspSharedState *s = (volatile pgspSharedState *) pgsp;
 
 		SpinLockAcquire(&s->mutex);
-		Assert(s->rdepend_size >= RDEPEND_SIZE(rentry->max_keys));
+		Assert(s->alloced_size >= RDEPEND_KEY_SIZE(rentry->max_keys));
 		SpinLockRelease(&s->mutex);
-#endif
 
 		Assert(dsfound);
 
@@ -150,15 +147,16 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 			return false;
 		}
 
-		pgsp->rdepend_size = add_size(pgsp->rdepend_size,
-								RDEPEND_SIZE(new_max_keys - rentry->max_keys));
-
 		new_rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, new_rkeys_p);
 		Assert(new_rkeys != NULL);
 
 		memcpy(new_rkeys, rkeys, sizeof(pgspHashKey) * new_max_keys);
 		rkeys = NULL;
 		dsa_free(pgsp_area, rentry->keys);
+
+		SpinLockAcquire(&s->mutex);
+		s->alloced_size += RDEPEND_KEY_SIZE(new_max_keys - rentry->max_keys);
+		SpinLockRelease(&s->mutex);
 
 		rentry->keys = new_rkeys_p;
 		rentry->max_keys = new_max_keys;
@@ -265,14 +263,14 @@ pgsp_entry_unregister_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 	{
 		volatile pgspSharedState *s = (volatile pgspSharedState *) pgsp;
 
-		Assert(pgsp->rdepend_size >= RDEPEND_SIZE(rentry->max_keys));
+		dsa_free(pgsp_area, rentry->keys);
 
 		SpinLockAcquire(&s->mutex);
-		s->rdepend_size -= RDEPEND_SIZE(rentry->max_keys);
+		Assert(s->alloced_size >= RDEPEND_KEY_SIZE(rentry->max_keys));
+		s->alloced_size -= RDEPEND_KEY_SIZE(rentry->max_keys);
 		s->rdepend_num--;
 		SpinLockRelease(&s->mutex);
 
-		dsa_free(pgsp_area, rentry->keys);
 		rentry->keys = InvalidDsaPointer;
 		dshash_delete_entry(pgsp_rdepend, rentry);
 	}

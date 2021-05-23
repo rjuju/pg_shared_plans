@@ -9,7 +9,7 @@
 --- Define pg_shared_plans_info
 CREATE FUNCTION pg_shared_plans_info(
     OUT rdepend_num int,
-    OUT rdepend_size bigint,
+    OUT alloced_size bigint,
     OUT dealloc bigint,
     OUT stats_reset timestamp with time zone
 )

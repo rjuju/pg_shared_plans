@@ -7,8 +7,8 @@ SELECT pg_shared_plans_reset();
  
 (1 row)
 
-SELECT rdepend_num, rdepend_size FROM pg_shared_plans_info;
- rdepend_num | rdepend_size 
+SELECT rdepend_num, alloced_size FROM pg_shared_plans_info;
+ rdepend_num | alloced_size 
 -------------+--------------
            0 |            0
 (1 row)

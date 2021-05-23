@@ -72,7 +72,7 @@ typedef struct pgspSharedState
 	double		cur_median_usage;	/* current median usage in hashtable */
 	slock_t		mutex;				/* protects following fields only */
 	int32		rdepend_num;		/* # of entries in the rdepend dshash */
-	int64		rdepend_size;		/* allocated size for rdepend entries */
+	int64		alloced_size;		/* allocated size for rdepend entries */
 	int64		dealloc;			/* # of times entries were deallocated */
 	TimestampTz stats_reset;		/* timestamp with all stats reset */
 } pgspSharedState;

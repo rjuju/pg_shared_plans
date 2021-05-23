@@ -55,6 +55,38 @@ PG_MODULE_MAGIC;
 
 #define PLANCACHE_THRESHOLD		5
 
+#define PGSP_USEDSMEM(size) {												\
+	volatile pgspSharedState *s = (volatile pgspSharedState *) pgsp;		\
+																			\
+	SpinLockAcquire(&s->mutex);												\
+	s->alloced_size += (size);												\
+	SpinLockRelease(&s->mutex);												\
+}
+
+#define PGSP_FREEDSMEM(size) {												\
+	volatile pgspSharedState *s = (volatile pgspSharedState *) pgsp;		\
+																			\
+	SpinLockAcquire(&s->mutex);												\
+	Assert(s->alloced_size >= (size));										\
+	s->alloced_size -= (size);												\
+	SpinLockRelease(&s->mutex);												\
+}
+
+#define PGSP_FREERELEASEDSMEM(where,what,size,sizefield) {					\
+	Assert(where->what != InvalidDsaPointer);								\
+		dsa_free(pgsp_area, where->what);									\
+		where->what = InvalidDsaPointer;									\
+		PGSP_FREEDSMEM(size);												\
+		where->sizefield = 0;												\
+}
+
+#define PGSP_TRANSFER(entry,context,field,counter) {						\
+	entry->field = context->field;											\
+	context->field = InvalidDsaPointer;										\
+	entry->counter = context->counter;										\
+	context->counter = 0;													\
+}
+
 
 typedef struct pgspDsaContext
 {
@@ -389,7 +421,7 @@ pgsp_shmem_startup(void)
 		pgsp->pgsp_rdepend_handle = InvalidDsaPointer;
 		pgsp->cur_median_usage = ASSUMED_MEDIAN_INIT;
 		pgsp->rdepend_num = 0;
-		pgsp->rdepend_size = 0;
+		pgsp->alloced_size = 0;
 		SpinLockInit(&pgsp->mutex);
 
 		/* try to guess our trancheid */
@@ -1057,6 +1089,8 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 	if (context->plan == InvalidDsaPointer)
 		return false;
 
+	PGSP_USEDSMEM(context->len);
+
 	local = dsa_get_address(pgsp_area, context->plan);
 	Assert(local != NULL);
 
@@ -1096,8 +1130,11 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 		if (context->plan == InvalidDsaPointer)
 		{
 			dsa_free(pgsp_area, context->plan);
+			PGSP_FREEDSMEM(context->len);
 			return false;
 		}
+
+		PGSP_USEDSMEM(array_len);
 
 		array = dsa_get_address(pgsp_area, context->rels);
 
@@ -1161,6 +1198,8 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 			goto free_plans;
 		}
 
+		PGSP_USEDSMEM(nb_alloced_inval * sizeof(pgspRdependKey));
+
 		rdeps = dsa_get_address(pgsp_area, context->rdeps);
 		memcpy(rdeps, rdeps_tmp, sizeof(pgspRdependKey) * nb_alloced_inval);
 	}
@@ -1198,6 +1237,9 @@ free_rels:
 	 */
 	if (!ok && nb_alloced_rels > 0)
 	{
+		Assert(context->plan != InvalidDsaPointer && context->len > 0);
+		Assert(oids != NIL && list_length(oids) >= nb_alloced_rels);
+
 		/* Free the plan. */
 		dsa_free(pgsp_area, context->plan);
 
@@ -1208,6 +1250,9 @@ free_rels:
 
 		/* And free the array of Oid. */
 		dsa_free(pgsp_area, context->rels);
+
+		PGSP_FREEDSMEM(context->len +
+						(list_length(oids) * sizeof(pgspRdependKey)));
 	}
 
 	LWLockRelease(pgsp->lock);
@@ -1310,8 +1355,8 @@ pgsp_evict_by_oid(Oid dbid, Oid classid, Oid oid, pgspEvictionKind kind)
 			/* We only report a discard of a plan that was previously valid. */
 			if (entry->plan != InvalidDsaPointer)
 			{
-				dsa_free(pgsp_area, entry->plan);
-				entry->plan = InvalidDsaPointer;
+				PGSP_FREERELEASEDSMEM(entry, plan, entry->len, len);
+
 				if (kind != PGSP_EVICT)
 					entry->discard++;
 			}
@@ -1522,6 +1567,11 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 		entry->usage = PGSP_USAGE_INIT;
 		entry->total_custom_cost = custom_cost;
 		entry->num_custom_plans = 1.0;
+
+		/* The context DSM were moved to the entry */
+		PGSP_TRANSFER(entry, context, plan, len);
+		PGSP_TRANSFER(entry, context, rels, num_rels);
+		PGSP_TRANSFER(entry, context, rdeps, num_rdeps);
 	}
 	else if (entry->plan == InvalidDsaPointer)
 	{
@@ -1538,7 +1588,7 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 			int		i;
 
 			/* Free the plan. */
-			dsa_free(pgsp_area, context->plan);
+			PGSP_FREERELEASEDSMEM(context, plan, context->len, len);
 
 			/* Free all saved rdepend. */
 			if (context->num_rels > 0)
@@ -1556,7 +1606,7 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 				rdeps = dsa_get_address(pgsp_area, context->rdeps);
 				Assert(rdeps != NULL);
 
-				for (i = 0; i < context->num_rels; i++)
+				for (i = 0; i < context->num_rdeps; i++)
 				{
 					Assert(rdeps[i].dbid == MyDatabaseId);
 					pgsp_entry_unregister_rdepend(rdeps[i].dbid,
@@ -1568,12 +1618,27 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 
 			/* And free the rdepend arrays. */
 			if (context->num_rels > 0)
-				dsa_free(pgsp_area, context->rels);
+			{
+				PGSP_FREERELEASEDSMEM(context, rels,
+						context->num_rels * sizeof(Oid), num_rels);
+			}
 			if (context->num_rdeps > 0)
-				dsa_free(pgsp_area, context->rdeps);
+			{
+				PGSP_FREERELEASEDSMEM(context, rdeps,
+						context->num_rdeps * sizeof(pgspRdependKey), num_rdeps);
+			}
 		}
 		else
-			entry->plan = context->plan;
+		{
+			/* Transfer the plan to the entry */
+			PGSP_TRANSFER(entry, context, plan, len);
+		}
+	}
+
+	/* Free the plan if it wasn't transferred */
+	if (context->plan != InvalidDsaPointer)
+	{
+		PGSP_FREERELEASEDSMEM(context, plan, context->len, len);
 	}
 
 	/* Update reverse dependencies */
@@ -1603,6 +1668,8 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 				int j;
 				bool rel_found = false;
 
+				Assert(OidIsValid(old[i]));
+
 				for (j = 0; j < context->num_rels; j++)
 				{
 					if (old[i] == new[j])
@@ -1618,10 +1685,11 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 												  old[i], key);
 				}
 			}
-			dsa_free(pgsp_area, entry->rels);
+			PGSP_FREERELEASEDSMEM(entry, rels, entry->num_rels * sizeof(Oid),
+					num_rels);
 		}
-		entry->rels = context->rels;
-		entry->num_rels = context->num_rels;
+
+		PGSP_TRANSFER(entry, context, rels, num_rels);
 
 		if (entry->rdeps != InvalidDsaPointer)
 		{
@@ -1665,14 +1733,25 @@ pgsp_entry_alloc(pgspHashKey *key, pgspDsaContext *context, double plantime,
 												  key);
 				}
 			}
-			dsa_free(pgsp_area, entry->rdeps);
+			PGSP_FREERELEASEDSMEM(entry, rdeps,
+					entry->num_rdeps * sizeof(pgspRdependKey),
+					num_rdeps);
 		}
-		entry->rdeps = context->rdeps;
-		entry->num_rdeps = context->num_rdeps;
+		PGSP_TRANSFER(entry, context, rdeps, num_rdeps);
 	}
 
-	Assert(entry->num_rels == context->num_rels);
-	Assert(entry->num_rdeps == context->num_rdeps);
+	if (context->rels != InvalidDsaPointer)
+	{
+		PGSP_FREERELEASEDSMEM(context, rels,
+				context->num_rels * sizeof(Oid),
+				num_rels);
+	}
+	if (context->rdeps != InvalidDsaPointer)
+	{
+		PGSP_FREERELEASEDSMEM(context, rdeps,
+				context->num_rdeps * sizeof(pgspRdependKey),
+				num_rdeps);
+	}
 
 	/* We should always have a valid handle if the entry isn't locked */
 	Assert(entry->plan != InvalidDsaPointer || lockers > 0);
@@ -1763,7 +1842,9 @@ pgsp_entry_remove(pgspEntry *entry)
 
 	/* Free the dsa allocated memory. */
 	if (entry->plan != InvalidDsaPointer)
-		dsa_free(pgsp_area, entry->plan);
+	{
+		PGSP_FREERELEASEDSMEM(entry, plan, entry->len, len);
+	}
 
 	if (entry->num_rels > 0)
 	{
@@ -1777,7 +1858,9 @@ pgsp_entry_remove(pgspEntry *entry)
 		for(i = 0; i < entry->num_rels; i++)
 			pgsp_entry_unregister_rdepend(entry->key.dbid, RELOID,
 										  array[i], &entry->key);
-		dsa_free(pgsp_area, entry->rels);
+
+		PGSP_FREERELEASEDSMEM(entry, rels, entry->num_rels * sizeof(Oid),
+				num_rels);
 	}
 	else
 	{
@@ -1795,7 +1878,10 @@ pgsp_entry_remove(pgspEntry *entry)
 		for (i = 0; i < entry->num_rdeps; i++)
 			pgsp_entry_unregister_rdepend(rdeps[i].dbid, rdeps[i].classid,
 										  rdeps[i].oid, &entry->key);
-		dsa_free(pgsp_area, entry->rdeps);
+
+		PGSP_FREERELEASEDSMEM(entry, rdeps,
+				entry->num_rdeps * sizeof(pgspRdependKey),
+				num_rdeps);
 	}
 	else
 	{
@@ -2108,7 +2194,7 @@ pg_shared_plans_info(PG_FUNCTION_ARGS)
 
 		SpinLockAcquire(&s->mutex);
 		values[i++] = Int32GetDatum(s->rdepend_num);
-		values[i++] = Int64GetDatum(s->rdepend_size);
+		values[i++] = Int64GetDatum(s->alloced_size);
 		values[i++] = Int64GetDatum(s->dealloc);
 		values[i++] = TimestampTzGetDatum(s->stats_reset);
 		SpinLockRelease(&s->mutex);
