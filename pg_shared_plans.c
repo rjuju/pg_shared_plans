@@ -1107,9 +1107,8 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 		 */
 		if (context->rels == InvalidDsaPointer)
 		{
-			dsa_free(pgsp_area, context->plan);
-			PGSP_FREEDSMEM(context->len);
-			return false;
+			ok = false;
+			goto free_plan;
 		}
 
 		PGSP_USEDSMEM(array_len);
@@ -1133,10 +1132,13 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 
 		if (!ok)
 		{
+			/* We'll have to unregister up to previous relation. */
 			nb_alloced_rels = i;
 			goto free_rels;
 		}
 	}
+	/* We'll have to unregister all relations. */
+	nb_alloced_rels = i;
 
 	/* Also save handled PlanInvanItem dependencies. */
 	extract_query_dependencies((Node *) parse, &rels, &invalItems,
@@ -1156,7 +1158,7 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 		ok = pgsp_entry_register_rdepend(MyDatabaseId, item->cacheId,
 										 item->hashValue, key);
 		if (!ok)
-			goto free_plans;
+			goto free_invals;
 
 		rdeps_tmp[nb_alloced_inval].dbid = MyDatabaseId;
 		rdeps_tmp[nb_alloced_inval].classid = item->cacheId;
@@ -1173,7 +1175,7 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 		if (context->rdeps == InvalidDsaPointer)
 		{
 			ok = false;
-			goto free_plans;
+			goto free_invals;
 		}
 
 		PGSP_USEDSMEM(nb_alloced_inval * sizeof(pgspRdependKey));
@@ -1184,13 +1186,15 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 
 	context->num_rdeps = nb_alloced_inval;
 
-free_plans:
+free_invals:
 	/*
 	 * If we couldn't register a type dependency, free all previously
 	 * allocated shared memory.
 	 */
 	if (!ok && nb_alloced_inval > 0)
 	{
+		Assert(context->rdeps == InvalidDsaPointer);
+
 		i = 0;
 		foreach(lc, invalItems)
 		{
@@ -1213,13 +1217,10 @@ free_rels:
 	 * If we couldn't register a relation dependency, free all previously
 	 * allocated shared memory.
 	 */
-	if (!ok && nb_alloced_rels > 0)
+	if (!ok && context->num_rels > 0)
 	{
 		Assert(context->plan != InvalidDsaPointer && context->len > 0);
 		Assert(oids != NIL && list_length(oids) >= nb_alloced_rels);
-
-		/* Free the plan. */
-		dsa_free(pgsp_area, context->plan);
 
 		Assert(array != NULL);
 		/* Free all saved rdepend. */
@@ -1227,10 +1228,18 @@ free_rels:
 			pgsp_entry_unregister_rdepend(MyDatabaseId, RELOID, array[i], key);
 
 		/* And free the array of Oid. */
+		Assert(context->rels != InvalidDsaPointer);
 		dsa_free(pgsp_area, context->rels);
+		PGSP_FREEDSMEM(list_length(oids) * sizeof(Oid));
+	}
 
-		PGSP_FREEDSMEM(context->len +
-						(list_length(oids) * sizeof(pgspRdependKey)));
+free_plan:
+
+	if (!ok)
+	{
+		/* Free the plan. */
+		dsa_free(pgsp_area, context->plan);
+		PGSP_FREEDSMEM(context->len);
 	}
 
 	LWLockRelease(pgsp->lock);

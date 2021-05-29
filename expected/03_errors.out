@@ -7,3 +7,427 @@ LIMIT 1;
  
 (1 row)
 
+-- reset the rest of the entries
+SELECT pg_shared_plans_reset();
+ pg_shared_plans_reset 
+-----------------------
+ 
+(1 row)
+
+SELECT rdepend_num, alloced_size FROM pg_shared_plans_info;
+ rdepend_num | alloced_size 
+-------------+--------------
+           0 |            0
+(1 row)
+
+--  Check error on max rdepend size
+SET pg_shared_plans.threshold = 1;
+SET pg_shared_plans.min_plan_time = 0;
+CREATE TABLE rdepend(id int);
+CREATE FUNCTION rfunc() RETURNS int AS $$
+BEGIN
+    RETURN 1;
+END;
+$$ VOLATILE LANGUAGE plpgsql;
+-- create more than pg_shared_plans.rdepend_max entries with different queryid
+-- with dependencies on a single function and a single table
+SELECT 'PREPARE rdepend_' || i || '(int) AS SELECT count(*)'
+    ' FROM ('
+    '   SELECT ' || string_agg('1', ',') || ', rfunc() FROM rdepend) s'
+FROM generate_series(1, 50) i, generate_series(1, i) j
+GROUP BY i
+ORDER by i \gexec
+PREPARE rdepend_1(int) AS SELECT count(*) FROM (   SELECT 1, rfunc() FROM rdepend) s
+PREPARE rdepend_2(int) AS SELECT count(*) FROM (   SELECT 1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_3(int) AS SELECT count(*) FROM (   SELECT 1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_4(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_5(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_6(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_7(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_8(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_9(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_10(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_11(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_12(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_13(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_14(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_15(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_16(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_17(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_18(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_19(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_20(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_21(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_22(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_23(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_24(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_25(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_26(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_27(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_28(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_29(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_30(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_31(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_32(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_33(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_34(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_35(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_36(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_37(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_38(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_39(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_40(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_41(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_42(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_43(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_44(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_45(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_46(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_47(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_48(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_49(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+PREPARE rdepend_50(int) AS SELECT count(*) FROM (   SELECT 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, rfunc() FROM rdepend) s
+SELECT 'EXECUTE rdepend_' || i || '(1)'
+FROM generate_series(1, 50) i \gexec
+EXECUTE rdepend_1(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_2(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_3(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_4(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_5(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_6(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_7(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_8(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_9(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_10(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_11(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_12(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_13(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_14(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_15(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_16(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_17(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_18(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_19(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_20(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_21(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_22(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_23(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_24(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_25(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_26(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_27(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_28(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_29(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_30(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_31(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_32(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_33(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_34(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_35(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_36(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_37(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_38(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_39(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_40(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_41(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_42(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_43(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_44(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_45(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_46(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_47(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_48(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_49(1)
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE rdepend_50(1)
+ count 
+-------
+     0
+(1 row)
+
+-- test failure on relation reverse dependency
+PREPARE rdepend_fail_1(int) AS SELECT * FROM rdepend WHERE id < $1;
+EXECUTE rdepend_fail_1(1);
+WARNING:  pgsp: Too many cache entries for relation "rdepend" on database "contrib_regression"
+HINT:  You might want to increase pg_shared_plans.rdepend_max
+ id 
+----
+(0 rows)
+
+SELECT count(*) FROM pg_shared_plans;
+ count 
+-------
+    50
+(1 row)
+
+-- test failure on proc reverse dependency
+PREPARE rdepend_fail_2(int) AS SELECT rfunc() FROM pg_class WHERE oid = $1;
+EXECUTE rdepend_fail_2(1);
+WARNING:  pgsp: Too many cache entries for routine "<unknown>" on database "contrib_regression"
+HINT:  You might want to increase pg_shared_plans.rdepend_max
+ rfunc 
+-------
+(0 rows)
+
+SELECT count(*) FROM pg_shared_plans;
+ count 
+-------
+    50
+(1 row)
+
+SELECT pg_shared_plans_reset();
+ pg_shared_plans_reset 
+-----------------------
+ 
+(1 row)
+
+SELECT rdepend_num, alloced_size FROM pg_shared_plans_info;
+ rdepend_num | alloced_size 
+-------------+--------------
+           0 |            0
+(1 row)
+

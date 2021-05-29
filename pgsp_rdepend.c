@@ -169,6 +169,7 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 			char *deptype;
 			char *depname;
 
+			Assert(dsfound);
 			pgsp_get_rdep_name(classid, oid, &deptype, &depname);
 
 			elog(WARNING, "pgsp: Could not cache entries for %s \"%s\""
@@ -193,9 +194,10 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 
 		rentry->keys = new_rkeys_p;
 		rentry->max_keys = new_max_keys;
+
+		rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
 	}
 
-	rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
 	Assert(rkeys != NULL);
 
 	rkeys[rentry->num_keys++] = *key;
