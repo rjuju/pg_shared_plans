@@ -105,13 +105,6 @@ typedef struct pgspWalkerContext
 } pgspWalkerContext;
 
 
-typedef struct pgspSrfState
-{
-	HASH_SEQ_STATUS hash_seq;
-	bool			hash_seq_term_called;
-	pgspHashKey	   *rkeys;
-} pgspSrfState;
-
 /*---- Local variables ----*/
 
 /* Saved hook values in case of unload */
@@ -181,7 +174,6 @@ static void pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 
 static void pgsp_attach_dsa(void);
 static void pg_shared_plans_reset_internal(Oid userid, Oid dbid, uint64 queryid);
-static void pg_shared_plans_shutdown(Datum arg);
 
 static void pgsp_accum_custom_plan(pgspHashKey *key, Cost cost);
 static void pgsp_acquire_executor_locks(PlannedStmt *plannedstmt, bool acquire);
@@ -959,20 +951,6 @@ pg_shared_plans_reset_internal(Oid userid, Oid dbid, uint64 queryid)
 	}
 
 	LWLockRelease(pgsp->lock);
-}
-
-/* Release pgsp->lock that was acquired during pg_shared_plans(). */
-static void
-pg_shared_plans_shutdown(Datum arg)
-{
-	pgspSrfState *state = (pgspSrfState *) DatumGetPointer(arg);
-	Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
-	if (!state->hash_seq_term_called)
-		hash_seq_term(&state->hash_seq);
-	LWLockRelease(pgsp->lock);
-	if (state->rkeys)
-		pfree(state->rkeys);
-	pfree(state);
 }
 
 /*
@@ -2207,153 +2185,112 @@ pg_shared_plans_info(PG_FUNCTION_ARGS)
 Datum
 pg_shared_plans(PG_FUNCTION_ARGS)
 {
-	pgspSrfState *state;
 	bool		showrels = PG_GETARG_BOOL(0);
 	bool		showplan = PG_GETARG_BOOL(1);
 	Oid			dbid = PG_GETARG_OID(2);
 	Oid			relid = PG_GETARG_OID(3);
-	FuncCallContext *fctx;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	pgspHashKey	   *rkeys;
+	int				rkeys_max, rkeys_cpt;
+	HASH_SEQ_STATUS hash_seq;
 	pgspEntry  *entry;
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not " \
+						"allowed in this context")));
+
+	/* Create or attach to the dsa. */
+	pgsp_attach_dsa();
+
+	/* Switch into long-lived context to construct returned data structures */
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	MemoryContextSwitchTo(oldcontext);
 
 	/* Default to current database. */
 	if (OidIsValid(relid) && !OidIsValid(dbid))
 		dbid = MyDatabaseId;
 
-	if (SRF_IS_FIRSTCALL())
+	/*
+	 * Get shared lock and iterate over the hashtable entries.
+	 *
+	 * With a large hash table, we might be holding the lock rather longer than
+	 * one could wish.  However, this only blocks creation of new hash table
+	 * entries, and the larger the hash table the less likely that is to be
+	 * needed.  So we can hope this is okay.  Perhaps someday we'll decide we
+	 * need to partition the hash table to limit the time spent holding any one
+	 * lock.
+	 */
+	LWLockAcquire(pgsp->lock, LW_SHARED);
+
+	/* Fast path if a specific relation is asked. */
+	if(OidIsValid(relid))
 	{
-		TupleDesc		tupdesc;
-		ReturnSetInfo *rsi = (ReturnSetInfo *) fcinfo->resultinfo;
-		MemoryContext	oldcontext;
-		int				i = 1;
+		pgspRdependKey		rkey = {dbid, RELOID, relid};
+		pgspRdependEntry   *rentry;
+		pgspHashKey		   *tmp_rkeys;
+		Size				size;
 
-		/* create a function context for cross-call persistence */
-		fctx = SRF_FIRSTCALL_INIT();
+		rentry = dshash_find(pgsp_rdepend, &rkey, false);
 
-		/* Create or attach to the dsa. */
-		pgsp_attach_dsa();
+		/* No corresponding entry, clean up and return the tuplestore. */
+		if (rentry == NULL)
+		{
+			LWLockRelease(pgsp->lock);
+			tuplestore_donestoring(tupstore);
+			return (Datum) 0;
+		}
 
-		oldcontext = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
+		rkeys_max = rentry->num_keys;
+		Assert(rkeys_max > 0);
+		rkeys_cpt = 0;
+		tmp_rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
+		Assert(tmp_rkeys != NULL);
 
-		/* build tupdesc for result tuples */
-		/* this had better match SQL definition in extension script */
-		tupdesc = CreateTemplateTupleDesc(PG_SHARED_PLANS_COLS);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "userid",
-						   OIDOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "dbid",
-						   OIDOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "queryid",
-						   INT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "constid",
-						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "num_const",
-						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "bypass",
-						   INT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "size",
-						   INT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "plantime",
-						   FLOAT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "total_custom_cost",
-						   FLOAT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "num_custom_plans",
-						   INT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "generic_cost",
-						   FLOAT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "num_relations",
-						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "num_rdeps",
-						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "discard",
-						   INT8OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "lockers",
-						   INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "relations",
-						   OIDARRAYOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) i++, "plans",
-						   TEXTOID, -1, 0);
-
-		Assert(i == PG_SHARED_PLANS_COLS + 1);
-		fctx->tuple_desc = BlessTupleDesc(tupdesc);
-
-		state = MemoryContextAlloc(TopMemoryContext, sizeof(pgspSrfState));
-		memset(state, 0, sizeof(pgspSrfState));
-
-		MemoryContextSwitchTo(oldcontext);
-
-		fctx->max_calls = hash_get_num_entries(pgsp_hash);
-		fctx->user_fctx = state;
+		size = sizeof(pgspHashKey) * rentry->num_keys;
+		rkeys = (pgspHashKey *) palloc(size);
+		memcpy(rkeys, tmp_rkeys, size);
 
 		/*
-		 * Get shared lock and iterate over the hashtable entries.
-		 *
-		 * With a large hash table, we might be holding the lock rather longer
-		 * than one could wish.  However, this only blocks creation of new hash
-		 * table entries, and the larger the hash table the less likely that is
-		 * to be needed.  So we can hope this is okay.  Perhaps someday we'll
-		 * decide we need to partition the hash table to limit the time spent
-		 * holding any one lock.
+		 * Release the rdepend entry, we'll iterate over the copy of the stored
+		 * hash keys in the main loop.
 		 */
-		LWLockAcquire(pgsp->lock, LW_SHARED);
-
-		if(OidIsValid(relid))
-		{
-			pgspRdependKey rkey = {dbid, RELOID, relid};
-			pgspRdependEntry *rentry;
-			pgspHashKey		 *rkeys;
-			size_t				size;
-
-			rentry = dshash_find(pgsp_rdepend, &rkey, false);
-
-			if (rentry == NULL)
-			{
-				LWLockRelease(pgsp->lock);
-				SRF_RETURN_DONE(fctx);
-			}
-
-			fctx->max_calls = rentry->num_keys;
-			rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
-			Assert(rkeys != NULL);
-
-			size = sizeof(pgspHashKey) * rentry->num_keys;
-			oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-			state->rkeys = (pgspHashKey *) palloc(size);
-			MemoryContextSwitchTo(oldcontext);
-			memcpy(state->rkeys, rkeys, size);
-
-			state->hash_seq_term_called = true;
-			dshash_release_lock(pgsp_rdepend, rentry);
-		}
-		else
-		{
-			oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-			hash_seq_init(&state->hash_seq, pgsp_hash);
-			MemoryContextSwitchTo(oldcontext);
-		}
-
-		RegisterExprContextCallback(rsi->econtext,
-				pg_shared_plans_shutdown,
-				PointerGetDatum(state));
-
+		dshash_release_lock(pgsp_rdepend, rentry);
+	}
+	else
+	{
+		/* We'll go through the whole hash. */
+		hash_seq_init(&hash_seq, pgsp_hash);
+		rkeys = NULL;
 	}
 
-	fctx = SRF_PERCALL_SETUP();
-	state = fctx->user_fctx;
-
-	entry = NULL;
-
-	if (state->rkeys != NULL)
-		entry = hash_search(pgsp_hash, &(state->rkeys[fctx->call_cntr]),
-							HASH_FIND, NULL);
-	else
-		entry = hash_seq_search(&state->hash_seq);
-
-	if (entry != NULL)
+	while (true)
 	{
-		HeapTuple	tuple;
 		Datum		values[PG_SHARED_PLANS_COLS];
 		bool		nulls[PG_SHARED_PLANS_COLS];
 		int			i = 0;
-		volatile pgspEntry *e = (volatile pgspEntry *) entry;
+		volatile pgspEntry *e;
 		int64		queryid;
 		int64		bypass;
 		int64		len;
@@ -2363,8 +2300,31 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		double		generic_cost;
 		int64		discard;
 
-		Assert(fctx->call_cntr < fctx->max_calls);
-		Assert(LWLockHeldByMeInMode(pgsp->lock, LW_SHARED));
+		memset(values, 0, sizeof(values));
+		memset(nulls, 0, sizeof(nulls));
+
+		/*
+		 * Get the next entry.  If user asked for entries with a dependency on
+		 * a specific relation, keep iterating on those, otherwise it goes
+		 * through the hash seq.
+		 */
+		if (rkeys != NULL)
+		{
+			if(rkeys_cpt == rkeys_max)
+				break;
+
+			entry = hash_search(pgsp_hash, &rkeys[rkeys_cpt++], HASH_FIND,
+								NULL);
+			Assert(entry);
+		}
+		else
+		{
+			entry = hash_seq_search(&hash_seq);
+			if (!entry)
+				break;
+		}
+
+		e = (volatile pgspEntry *) entry;
 
 		queryid = entry->key.queryid;
 		len = entry->len;
@@ -2377,9 +2337,6 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		total_custom_cost = entry-> total_custom_cost;
 		num_custom_plans = entry->num_custom_plans;
 		SpinLockRelease(&e->mutex);
-
-		memset(values, 0, sizeof(values));
-		memset(nulls, 0, sizeof(nulls));
 
 		if (OidIsValid(entry->key.userid))
 			values[i++] = ObjectIdGetDatum(entry->key.userid);
@@ -2426,14 +2383,17 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 			nulls[i++] = true;
 
 		Assert(i == PG_SHARED_PLANS_COLS);
-
-		tuple = heap_form_tuple(fctx->tuple_desc, values, nulls);
-		SRF_RETURN_NEXT(fctx, HeapTupleGetDatum(tuple));
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
-	else
-		state->hash_seq_term_called = true;
 
-	/* LWLockRelease will be called in pg_shared_plans_shutdown(). */
+	if (rkeys)
+	{
+		Assert(rkeys_cpt == rkeys_max);
+		pfree(rkeys);
+	}
 
-	SRF_RETURN_DONE(fctx);
+	/* clean up and return the tuplestore */
+	LWLockRelease(pgsp->lock);
+	tuplestore_donestoring(tupstore);
+	return (Datum) 0;
 }

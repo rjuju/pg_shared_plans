@@ -1,6 +1,6 @@
 EXTENSION    = pg_shared_plans
 EXTVERSION   = $(shell grep default_version $(EXTENSION).control | sed -e "s/default_version[[:space:]]*=[[:space:]]*'\([^']*\)'/\1/")
-REGRESS      = 00_setup 01_general 02_advanced 10_index 20_partition
+REGRESS      = 00_setup 01_general 02_advanced 03_errors 10_index 20_partition
 
 REGRESS_OPTS = --inputdir=test
 
