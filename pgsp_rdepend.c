@@ -59,6 +59,12 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 	if (classid != RELOID && classid != TYPEOID && classid != PROCOID)
 		elog(ERROR, "pgsp: rdepend classid %d not handled", classid);
 
+	/*
+	 * The area is pinned, so we can't process an interrupt here as we
+	 * could otherwise leak memory permanently.
+	 */
+	HOLD_INTERRUPTS();
+
 	rentry = dshash_find_or_insert(pgsp_rdepend, &rkey, &dsfound);
 
 	if (!dsfound)
@@ -74,7 +80,7 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 		if (rentry->keys == InvalidDsaPointer)
 		{
 			dshash_delete_entry(pgsp_rdepend, rentry);
-
+			RESUME_INTERRUPTS();
 			return false;
 		}
 
@@ -82,8 +88,42 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 		s->rdepend_num++;
 		s->alloced_size += RDEPEND_KEY_SIZE(PGSP_RDEPEND_INIT);
 		SpinLockRelease(&s->mutex);
+
+		rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
+		Assert(rkeys != NULL);
+	}
+	else
+	{
+		/* Check first if the rdepend is already registered */
+		rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
+		Assert(rkeys != NULL);
+
+		found = false;
+		for (i = 0; i < rentry->num_keys; i++)
+		{
+			if (pgsp_match_fn(key, &(rkeys[i]), 0) == 0)
+			{
+				found = true;
+#if defined(USE_ASSERT_CHECKING)
+				continue;
+#else
+				break;
+#endif
+			}
+#if defined(USE_ASSERT_CHECKING)
+			Assert(pgsp_match_fn(key, &(rkeys[i]), 0) != 0);
+#endif
+		}
+
+		if (found)
+		{
+			dshash_release_lock(pgsp_rdepend, rentry);
+			RESUME_INTERRUPTS();
+			return true;
+		}
 	}
 	Assert(rentry->keys != InvalidDsaPointer);
+	Assert(rkeys != NULL);
 
 	if (rentry->num_keys >= rentry->max_keys)
 	{
@@ -117,17 +157,10 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 						" pg_shared_plans.rdepend_max"));
 
 			dshash_release_lock(pgsp_rdepend, rentry);
+			RESUME_INTERRUPTS();
 			return false;
 		}
 
-		rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
-		Assert(rkeys != NULL);
-
-		/*
-		 * The area is pinned, so we can't process an interrupt here as we
-		 * could otherwise leak memory permanently.
-		 */
-		HOLD_INTERRUPTS();
 		new_rkeys_p = dsa_allocate_extended(pgsp_area,
 											sizeof(pgspHashKey) * new_max_keys,
 											DSA_ALLOC_NO_OOM);
@@ -160,45 +193,15 @@ pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key)
 
 		rentry->keys = new_rkeys_p;
 		rentry->max_keys = new_max_keys;
-
-		RESUME_INTERRUPTS();
 	}
 
 	rkeys = (pgspHashKey *) dsa_get_address(pgsp_area, rentry->keys);
 	Assert(rkeys != NULL);
 
-	/* Check first if the rdepend is already registered */
-	found = false;
-	for (i = 0; i < rentry->num_keys; i++)
-	{
-		if (pgsp_match_fn(key, &(rkeys[i]), 0) == 0)
-		{
-			found = true;
-#if defined(USE_ASSERT_CHECKING)
-			continue;
-#else
-			break;
-#endif
-		}
-#if defined(USE_ASSERT_CHECKING)
-		Assert(pgsp_match_fn(key, &(rkeys[i]), 0) != 0);
-#endif
-	}
-
-	if (!found)
-		rkeys[rentry->num_keys++] = *key;
-	else
-	{
-		Assert(dsfound);
-	}
-
-	/* Just extra safety check. */
-	if(!dsfound)
-	{
-		Assert(!found);
-	}
+	rkeys[rentry->num_keys++] = *key;
 
 	dshash_release_lock(pgsp_rdepend, rentry);
+	RESUME_INTERRUPTS();
 
 	return true;
 }
@@ -307,7 +310,7 @@ pgsp_get_rdep_name(Oid classid, Oid oid, char **deptype, char **depname)
 	{
 		*depname = get_func_name(oid);
 		if (!*depname)
-			*depname = "<unknown";
+			*depname = "<unknown>";
 		*deptype = "routine";
 	}
 	else
