@@ -35,6 +35,9 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#if PG_VERSION_NUM >= 140000
+#include "utils/queryjumble.h"
+#endif
 #include "utils/syscache.h"
 #if PG_VERSION_NUM < 140000
 #include "utils/timestamp.h"
@@ -213,6 +216,14 @@ _PG_init(void)
 		elog(ERROR, "This module can only be loaded via shared_preload_libraries");
 		return;
 	}
+
+#if PG_VERSION_NUM >= 140000
+	/*
+	 * Inform the postmaster that we want to enable query_id calculation if
+	 * compute_query_id is set to auto.
+	 */
+	EnableQueryId();
+#endif
 
 	/*
 	 * Define (or redefine) custom GUC variables.
@@ -468,6 +479,10 @@ pgsp_planner_hook(Query *parse,
 	pgspWalkerContext context;
 
 	if (!pgsp_enabled || parse->queryId == UINT64CONST(0) ||
+#if PG_VERSION_NUM >= 140000
+			/* 3rd party query_id implementation may not be suitable. */
+			compute_query_id == COMPUTE_QUERY_ID_OFF ||
+#endif
 #ifdef USE_ASSERT_CHECKING
 			(!pgsp_cache_all && boundParams == NULL)
 #else
