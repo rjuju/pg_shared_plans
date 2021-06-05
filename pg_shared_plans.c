@@ -13,6 +13,7 @@
 
 #include "postgres.h"
 
+#include "access/parallel.h"
 #include "access/relation.h"
 #if PG_VERSION_NUM < 130000
 #include "catalog/pg_type_d.h"
@@ -382,7 +383,7 @@ _PG_fini(void)
 static void
 pgsp_assign_rdepend_max(int newval, void *extra)
 {
-	if (newval < pgsp_rdepend_max)
+	if (!IsParallelWorker() && newval < pgsp_rdepend_max)
 		elog(WARNING, "New value for pg_shared_plans.rdepend_max (%d)"
 				" is lower than the previous value (%d). Existing entries"
 				" won't be affected.", newval, pgsp_rdepend_max);
