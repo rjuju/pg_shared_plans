@@ -44,6 +44,10 @@ Configuration
 
 The following configuration options are available:
 
+- pg_shared_plans.disable_plan_cache: Entirely bypass the core plancache for
+  handled statements.  This can save memory as backends won't store a local
+  generic plan anymore, but in order to work the extension must return a query
+  with a negative total cost ( current `- original_total_cost`). (default: off)
 - pg_shared_plans.enabled: Enable or disable pg_shared_plans (default: on)
 - pg_shared_plans.max: Maximum number of plans to cache in shared memory
   (default: 200)

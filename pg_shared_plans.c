@@ -127,6 +127,7 @@ dshash_table *pgsp_rdepend = NULL;
 #ifdef USE_ASSERT_CHECKING
 static bool pgsp_cache_all;
 #endif
+static bool pgsp_disable_plancache;
 static bool pgsp_enabled;
 static int	pgsp_max;
 static int	pgsp_min_plantime;
@@ -241,6 +242,17 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 #endif
+
+	DefineCustomBoolVariable("pg_shared_plans.disable_plan_cache",
+							 "Completely bypass the core plancache for handled plans.",
+							 NULL,
+							 &pgsp_disable_plancache,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 
 	DefineCustomBoolVariable("pg_shared_plans.enabled",
 							 "Enable or disable pg_shared_plans.",
@@ -555,6 +567,7 @@ pgsp_planner_hook(Query *parse,
 		if (local != NULL)
 		{
 			bool	use_cached;
+			int		bypass;
 
 			use_cached = pgsp_choose_cache_plan(entry, &accum_custom_stats);
 
@@ -572,9 +585,12 @@ pgsp_planner_hook(Query *parse,
 				LWLockAcquire(pgsp->lock, LW_SHARED);
 				entry = (pgspEntry *) hash_search(pgsp_hash, &key, HASH_FIND,
 												  NULL);
+
 				if (entry == NULL || entry->plan == InvalidDsaPointer ||
 						entry->discard != discard)
 					use_cached = false;
+				else
+					bypass = entry->bypass;
 
 				entry = NULL;
 				LWLockRelease(pgsp->lock);
@@ -604,7 +620,7 @@ pgsp_planner_hook(Query *parse,
 				 * custom plan (our shared cached one) should be preferred over
 				 * a generic one.  This will unfortunately only work if the
 				 * query is otherwise costly enough, as we don't want to return
-				 * a negative cost.
+				 * a negative cost unless pgsp_disable_plancache is set.
 				 */
 				nb_rels = list_length(result->rtable);
 
@@ -621,13 +637,33 @@ pgsp_planner_hook(Query *parse,
 				/* And add a safety margin, just in case. */
 				diff += 0.01;
 
+				if (pgsp_disable_plancache)
+				{
+					/*
+					 * If we already adjusted the cost enough to have an
+					 * average custom cost less than -1, just use the negative
+					 * cost to display a value that can be a bit more helpful,
+					 * otherwise keep adjusting the accumulated diff cost to
+					 * make sure that the average cost will be less than -1.
+					 */
+					if (bypass > (PLANCACHE_THRESHOLD - pgsp_threshold))
+						diff = result->planTree->total_cost * 2;
+					else
+						diff += result->planTree->total_cost * 2 *
+							pgsp_threshold;
+				}
+
 				/*
 				 * And finally remove that from the plan's total cost, making
-				 * sure that the total cost isn't negative.
+				 * sure that the total cost isn't negative if
+				 * pgsp_disable_plancache isn't set.
 				 */
 				result->planTree->total_cost -= diff;
-				if (result->planTree->total_cost <= 0.0)
-					result->planTree->total_cost = 0.001;
+				if (!pgsp_disable_plancache)
+				{
+					if (result->planTree->total_cost <= 0.0)
+						result->planTree->total_cost = 0.001;
+				}
 
 				return result;
 			}
