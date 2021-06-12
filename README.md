@@ -9,13 +9,20 @@ shared memory.
 It can coexist with the current infrastucture for the local plan cache manager,
 as plans that are not cached by pg_shared_plans can still be cached by it.
 
-This extension requires pg_stat_statements to be installed, in order to
-uniquely identify normalized queries.
+Until PostgreSQL 13, this extension requires pg_stat_statements to be
+installed, in order to uniquely identify normalized queries.  For PostgreSQL 14
+and upper, compute_query_id needs to be enabled.
 
 Using the query identifier is not enough to uniquement identify a statements.
 An additional constid hash is calculated for each entries based on the
 constants still present in the queries.  Also, the userid will also be recorded
 if the query depends on row level security enabled relations.
+
+Known limitations
+-----------------
+
+This extension won't work properly on a standby server, as it's not possible to
+reliably detect DDL changes and discard the needed entries.
 
 Installation
 ------------
