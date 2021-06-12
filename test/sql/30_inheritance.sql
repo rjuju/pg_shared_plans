@@ -1,3 +1,4 @@
+SET pg_shared_plans.threshold = 1;
 SELECT pg_shared_plans_reset();
 
 CREATE TABLE inh_a(id1 integer);

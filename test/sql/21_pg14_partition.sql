@@ -1,3 +1,4 @@
+SET pg_shared_plans.threshold = 1;
 PREPARE part_list(int) AS SELECT id1 FROM part_list WHERE id1 = $1;
 PREPARE part_list_1(int) AS SELECT id1 FROM part_list_1 WHERE id1 = $1;
 PREPARE part_list_1_1(int) AS SELECT id1 FROM part_list_1_1 WHERE id1 = $1;

@@ -1,3 +1,4 @@
+SET pg_shared_plans.threshold = 1;
 ----------------------------
 -- new in pg13: WITH TIES --
 ----------------------------
