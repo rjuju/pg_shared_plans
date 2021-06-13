@@ -401,7 +401,7 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 		char		   *funcname;
 		Oid			namespaceId;
 		oidvector  *parameterTypes;
-		Oid		   *sigArgTypes;
+		Oid		   *inTypes;
 		int			sigArgCount = 0;
 		int			varCount = 0;
 		ListCell	   *x;
@@ -443,14 +443,23 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 		languageOid = languageStruct->oid;
 		ReleaseSysCache(tup);
 
-		sigArgTypes = (Oid *) palloc(parameterCount * sizeof(Oid));
+		inTypes = (Oid *) palloc(parameterCount * sizeof(Oid));
 
 		foreach(x, stmt->parameters)
 		{
 			FunctionParameter *fp = (FunctionParameter *) lfirst(x);
 			TypeName   *t = fp->argType;
+			FunctionParameterMode fpmode = fp->mode;
 			Oid			toid;
 			Type		typtup;
+
+#if PG_VERSION_NUM >= 140000
+			/*
+			 * For our purposes here, a defaulted mode spec is identical to IN
+			 */
+			if (fpmode == FUNC_PARAM_DEFAULT)
+				fpmode = FUNC_PARAM_IN;
+#endif
 
 			typtup = LookupTypeName(NULL, t, NULL, false);
 			if (typtup)
@@ -471,17 +480,16 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 			}
 
 			/* handle signature parameters */
-			if (fp->mode == FUNC_PARAM_IN || fp->mode == FUNC_PARAM_INOUT ||
-				(stmt->is_procedure && fp->mode == FUNC_PARAM_OUT) ||
-				fp->mode == FUNC_PARAM_VARIADIC)
+			if (fpmode == FUNC_PARAM_IN || fpmode == FUNC_PARAM_INOUT ||
+				fpmode == FUNC_PARAM_VARIADIC)
 			{
 				/* Will error out in UTILITY execution, ignore. */
 				if (varCount > 0)
 					return;
-				sigArgTypes[sigArgCount++] = toid;
+				inTypes[sigArgCount++] = toid;
 			}
 
-			if (fp->mode == FUNC_PARAM_VARIADIC)
+			if (fpmode == FUNC_PARAM_VARIADIC)
 			{
 				varCount++;
 				/* validate variadic parameter type */
@@ -505,7 +513,7 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 		}
 
 		/* Now construct the proper outputs as needed */
-		parameterTypes = buildoidvector(sigArgTypes, sigArgCount);
+		parameterTypes = buildoidvector(inTypes, sigArgCount);
 
 		tup = SearchSysCache3(PROCNAMEARGSNSP,
 				PointerGetDatum(funcname),
