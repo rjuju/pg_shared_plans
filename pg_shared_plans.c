@@ -166,6 +166,9 @@ static PlannedStmt *pgsp_planner_hook(Query *parse,
 									  int cursorOptions,
 									  ParamListInfo boundParams);
 static void pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+#if PG_VERSION_NUM >= 140000
+								bool readOnlyTree,
+#endif
 								ProcessUtilityContext context,
 								ParamListInfo params,
 								QueryEnvironment *queryEnv,
@@ -769,6 +772,9 @@ fallback:
  */
 static void
 pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+#if PG_VERSION_NUM >= 140000
+					bool readOnlyTree,
+#endif
 					ProcessUtilityContext context,
 					ParamListInfo params,
 					QueryEnvironment *queryEnv,
@@ -800,6 +806,9 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	/* Run the utility. */
 	if (prev_ProcessUtility)
 		prev_ProcessUtility(pstmt, queryString,
+#if PG_VERSION_NUM >= 140000
+				readOnlyTree,
+#endif
 				context, params, queryEnv,
 				dest,
 #if PG_VERSION_NUM >= 130000
@@ -810,6 +819,9 @@ pgsp_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				);
 	else
 		standard_ProcessUtility(pstmt, queryString,
+#if PG_VERSION_NUM >= 140000
+				readOnlyTree,
+#endif
 				context, params, queryEnv,
 				dest,
 #if PG_VERSION_NUM >= 130000
