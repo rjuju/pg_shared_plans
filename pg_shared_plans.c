@@ -152,7 +152,6 @@ static const struct config_enum_entry pgsp_explain_format_options[] =
 /*---- Function declarations ----*/
 
 PGDLLEXPORT void _PG_init(void);
-PGDLLEXPORT void _PG_fini(void);
 
 PG_FUNCTION_INFO_V1(pg_shared_plans_reset);
 PG_FUNCTION_INFO_V1(pg_shared_plans_info);
@@ -383,16 +382,6 @@ _PG_init(void)
 	planner_hook = pgsp_planner_hook;
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = pgsp_ProcessUtility;
-}
-
-void
-_PG_fini(void)
-{
-	/* uninstall hooks */
-	shmem_startup_hook = prev_shmem_startup_hook;
-	planner_hook = prev_planner_hook;
-	ProcessUtility_hook = prev_ProcessUtility;
-
 }
 
 static void
