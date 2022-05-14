@@ -157,6 +157,9 @@ PG_FUNCTION_INFO_V1(pg_shared_plans_reset);
 PG_FUNCTION_INFO_V1(pg_shared_plans_info);
 PG_FUNCTION_INFO_V1(pg_shared_plans);
 
+#if PG_VERSION_NUM >= 150000
+static void pgsp_shmem_request(void);
+#endif
 static void pgsp_shmem_startup(void);
 static PlannedStmt *pgsp_planner_hook(Query *parse,
 #if PG_VERSION_NUM >= 130000
@@ -367,6 +370,7 @@ _PG_init(void)
 
 	EmitWarningsOnPlaceholders("pg_shared_plans");
 
+#if PG_VERSION_NUM < 150000
 	/*
 	 * Request additional shared resources.  (These are no-ops if we're not in
 	 * the postmaster process.)  We'll allocate or attach to the shared
@@ -374,8 +378,13 @@ _PG_init(void)
 	 */
 	RequestAddinShmemSpace(pgsp_memsize());
 	RequestNamedLWLockTranche(PGSP_TRANCHE_NAME, 1);
+#endif
 
 	/* Install hooks */
+#if PG_VERSION_NUM >= 150000
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = pgsp_shmem_request;
+#endif
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pgsp_shmem_startup;
 	prev_planner_hook = planner_hook;
@@ -392,6 +401,18 @@ pgsp_assign_rdepend_max(int newval, void *extra)
 				" is lower than the previous value (%d). Existing entries"
 				" won't be affected.", newval, pgsp_rdepend_max);
 }
+
+#if PG_VERSION_NUM >= 150000
+static void
+pgsp_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+
+	RequestAddinShmemSpace(pgsp_memsize());
+	RequestNamedLWLockTranche(PGSP_TRANCHE_NAME, 1);
+}
+#endif
 
 /*
  * shmem_startup hook: allocate or attach to shared memory,
