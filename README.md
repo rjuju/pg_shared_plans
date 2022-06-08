@@ -13,7 +13,7 @@ Until PostgreSQL 13, this extension requires pg_stat_statements to be
 installed, in order to uniquely identify normalized queries.  For PostgreSQL 14
 and upper, compute_query_id needs to be enabled.
 
-Using the query identifier is not enough to uniquement identify a statements.
+Using the query identifier is not enough to uniquely identify a statements.
 An additional constid hash is calculated for each entries based on the
 constants still present in the queries.  Also, the userid will also be recorded
 if the query depends on row level security enabled relations.
