@@ -113,6 +113,9 @@ typedef struct pgspWalkerContext
 
 /* Saved hook values in case of unload */
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+#if PG_VERSION_NUM >= 150000
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+#endif
 static planner_hook_type prev_planner_hook = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 
