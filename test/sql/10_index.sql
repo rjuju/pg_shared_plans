@@ -1,4 +1,5 @@
 SET pg_shared_plans.threshold = 1;
+SET pg_shared_plans.min_plan_time = 0;
 SELECT pg_shared_plans_reset();
 -- Dropped index
 CREATE TABLE t_ind AS SELECT id FROM generate_series(1, 10000) id;

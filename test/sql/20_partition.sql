@@ -1,4 +1,5 @@
 SET pg_shared_plans.threshold = 1;
+SET pg_shared_plans.min_plan_time = 0;
 SELECT pg_shared_plans_reset();
 -- we'll often discard cached plans, to make sure plancache won't choose its
 -- own cached plans.
