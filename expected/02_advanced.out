@@ -481,10 +481,10 @@ SELECT bypass FROM pg_shared_plans WHERE query LIKE '%SELECT a, b, c%';
 -- alias' colnames
 --
 CREATE TABLE colname AS SELECT 0 AS id, 'zero' AS val;
-PREPARE colname_1(int) AS SELECT row_to_json(t) FROM colname t WHERE id = $1;
+PREPARE colname_1(int) AS SELECT row_to_json(t) FROM (SELECT * FROM colname t WHERE id = $1) t;
 -- pg_stat_statements will generate the same queryid for this query, make sure
 -- we see it as a different one
-PREPARE colname_2(int) AS SELECT row_to_json(t) FROM colname t(a, b) WHERE a = $1;
+PREPARE colname_2(int) AS SELECT row_to_json(t) FROM (SELECT * FROM colname t(a, b) WHERE a = $1) t;
 EXECUTE colname_1(0);
       row_to_json      
 -----------------------

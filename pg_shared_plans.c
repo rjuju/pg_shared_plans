@@ -2035,7 +2035,7 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 
 				foreach(lc2, rte->alias->colnames)
 				{
-					unsigned char  *colname = (unsigned char *) lfirst(lc2);
+					unsigned char  *colname = (unsigned char *) strVal(lfirst(lc2));
 					int				len = strlen((char *) colname);
 
 					context->constid = hash_combine(context->constid,
