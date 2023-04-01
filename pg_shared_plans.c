@@ -15,6 +15,9 @@
 
 #include "access/parallel.h"
 #include "access/relation.h"
+#if PG_VERSION_NUM >= 160000
+#include "catalog/pg_proc.h"
+#endif
 #if PG_VERSION_NUM < 130000
 #include "catalog/pg_type_d.h"
 #endif
@@ -37,8 +40,12 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #if PG_VERSION_NUM >= 140000
+#if PG_VERSION_NUM < 160000
 #include "utils/queryjumble.h"
-#endif
+#else
+#include "nodes/queryjumble.h"
+#endif		/* pg16- */
+#endif		/* pg14+ */
 #include "utils/syscache.h"
 #if PG_VERSION_NUM < 140000
 #include "utils/timestamp.h"
@@ -2081,7 +2088,12 @@ pgsp_query_walker(Node *node, pgspWalkerContext *context)
 		Oid			funcid = ((FuncExpr *) node)->funcid;
 		AclResult	aclresult;
 
+#if PG_VERSION_NUM >= 160000
+		aclresult = object_aclcheck(ProcedureRelationId, funcid, GetUserId(),
+									ACL_EXECUTE);
+#else
 		aclresult = pg_proc_aclcheck(funcid, GetUserId(), ACL_EXECUTE);
+#endif
 		/*
 		 * The query is going to error out,so abort now and let
 		 * standard_planner raise the error.
