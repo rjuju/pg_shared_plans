@@ -1165,8 +1165,14 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 		RangeTblEntry  *rte = lfirst_node(RangeTblEntry, lc);
 
 		/* We only need to add dependency for real relations. */
-		if (rte->rtekind != RTE_RELATION)
+		if (rte->rtekind != RTE_RELATION
+#if PG_VERSION_NUM >= 160000
+				&& !(rte->rtekind == RTE_SUBQUERY && OidIsValid(rte->relid))
+#endif
+		   )
+		{
 			continue;
+		}
 
 		Assert(OidIsValid(rte->relid));
 		oids = list_append_unique_oid(oids, rte->relid);
@@ -1201,7 +1207,7 @@ pgsp_allocate_plan(Query *parse, PlannedStmt *stmt, pgspDsaContext *context,
 
 		i = 0;
 		foreach(lc, oids)
-				array[i++] = lfirst_oid(lc);
+			array[i++] = lfirst_oid(lc);
 
 		Assert(i == list_length(oids));
 	}
