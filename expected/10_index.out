@@ -59,7 +59,7 @@ SELECT discard, bypass, lockers FROM pg_shared_plans WHERE query LIKE '%t_ind%';
        2 |      1 |       0
 (1 row)
 
-DROP INDEX CONCURRENTLY t_ind_idx;
+REINDEX INDEX CONCURRENTLY t_ind_idx;
 -- cached plan should be discarded, entry preserved
 EXECUTE t_ind(1);
  id 
@@ -72,5 +72,20 @@ SELECT discard, bypass, lockers FROM pg_shared_plans WHERE query LIKE '%t_ind%';
  discard | bypass | lockers 
 ---------+--------+---------
        3 |      1 |       0
+(1 row)
+
+DROP INDEX CONCURRENTLY t_ind_idx;
+-- cached plan should be discarded, entry preserved
+EXECUTE t_ind(1);
+ id 
+----
+  1
+(1 row)
+
+-- plan should have been discarded 4 times, and kept its previous counters
+SELECT discard, bypass, lockers FROM pg_shared_plans WHERE query LIKE '%t_ind%';
+ discard | bypass | lockers 
+---------+--------+---------
+       4 |      1 |       0
 (1 row)
 

@@ -145,7 +145,8 @@ remove_oid(Oid classid, Oid oid, pgspUtilityContext *c)
 	c->has_remove = true;
 }
 
-/* For UTILITY with CONCURRENTLY option, the altered object property will be
+/*
+ * For UTILITY with CONCURRENTLY option, the altered object property will be
  * changed in the middle of the execution, with no AEL kept long enough to
  * protect our cache.  So the best we can do since we can't hook on the catalog
  * invalidation infrastructure is to
@@ -361,7 +362,8 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 #endif
 	else if (IsA(parsetree, AlterTSDictionaryStmt))
 	{
-		/* We have no way to track dependencies on TEXT SEARCH DICTIONNARY, so
+		/*
+		 * We have no way to track dependencies on TEXT SEARCH DICTIONNARY, so
 		 * the only way to avoid returning false result is to entirely drop the
 		 * cache for the current database.  Hopefully such commands should not
 		 * be frequent so it won't be a big issue.
@@ -530,6 +532,151 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 			ReleaseSysCache(tup);
 		}
 	}
+	else if (IsA(parsetree, ReindexStmt))
+	{
+		ReindexStmt *rdx = (ReindexStmt *) parsetree;
+		RangeVar *rel = rdx->relation;
+#if PG_VERSION_NUM >= 120000
+		bool		concurrently = false;
+		ListCell   *lc;
+#endif
+
+#if PG_VERSION_NUM >= 120000
+		/* Figure out if CONCURRENTLY was specified. */
+		foreach(lc, rdx->params)
+		{
+			DefElem    *opt = (DefElem *) lfirst(lc);
+
+			if (strcmp(opt->defname, "concurrently") == 0)
+			{
+				concurrently = true;
+				break;
+			}
+		}
+
+		/*
+		 * Don't mess  up with the transactions if the command is gonna
+		 * fail.
+		 */
+		if (concurrently &&
+			(GetTopTransactionIdIfAny() != InvalidTransactionId ||
+			 IsTransactionBlock())
+		)
+			return;
+
+		/*
+		 * For commands that reindex a lot of objects, just discard the whole
+		 * cache, whether it's CONCURRENT or not.
+		 *
+		 * FIXME: there is probably a possibility of caching issue in some
+		 * corner cases, but this should be rare enough that for now relying on
+		 * user explicitly discarding the cache is enough.
+		 */
+		if (rdx->name != NULL)
+		{
+			Assert(rel == NULL);
+			c->reset_current_db = true;
+		}
+
+		Assert(rel != NULL);
+
+		/* FIXME: refactor this code and the DropStmt code. */
+		switch (rdx->kind)
+		{
+			case REINDEX_OBJECT_INDEX:
+				{
+					Oid			indoid, heapoid;
+
+					/*
+					 * XXX: is it really ok to ignore permissions here, as
+					 * standard_ProcessUtility will fail before we actually use
+					 * the generated list?
+					 */
+					indoid = RangeVarGetRelidExtended(rel, AccessExclusiveLock,
+							RVR_MISSING_OK, NULL, NULL);
+					if (!OidIsValid(indoid))
+						break; /* XXX can that happen? */
+
+					heapoid = IndexGetRelation(indoid, true);
+					if (!OidIsValid(heapoid))
+						break; /* XXX can that happen? */
+
+					/*
+					 * Got the root table, directly add its oid to the discard
+					 * list.
+					 */
+					if (concurrently)
+						lock_oid(RELOID, heapoid, c);
+					else
+						discard_oid(RELOID, heapoid, c);
+
+					/*
+					 * RIC expects to be the first command in a transaction, so
+					 * commit the transaction that we just started when looking
+					 * for the root table name and start a fresh one.
+					 */
+					if (concurrently)
+					{
+						MemoryContext	oldcontext = CurrentMemoryContext;
+
+						PopActiveSnapshot();
+						CommitTransactionCommand();
+						StartTransactionCommand();
+						MemoryContextSwitchTo(oldcontext);
+						PushActiveSnapshot(GetTransactionSnapshot());
+					}
+
+					break;
+				}
+			case REINDEX_OBJECT_TABLE:
+				{
+					Oid			heapoid;
+
+					/*
+					 * XXX: is it really ok to ignore permissions here, as
+					 * standard_ProcessUtility will fail before we actually use
+					 * the generated list?
+					 */
+					heapoid = RangeVarGetRelidExtended(rel, AccessExclusiveLock,
+							RVR_MISSING_OK, NULL, NULL);
+					if (!OidIsValid(heapoid))
+						break; /* XXX can that happen? */
+
+					/*
+					 * Got the table oid, directly add its oid to the discard
+					 * list.
+					 */
+					if (concurrently)
+						lock_oid(RELOID, heapoid, c);
+					else
+						discard_oid(RELOID, heapoid, c);
+
+					/*
+					 * RTC expects to be the first command in a transaction, so
+					 * commit the transaction that we just started when looking
+					 * for the root table name and start a fresh one.
+					 */
+					if (concurrently)
+					{
+						MemoryContext	oldcontext = CurrentMemoryContext;
+
+						PopActiveSnapshot();
+						CommitTransactionCommand();
+						StartTransactionCommand();
+						MemoryContextSwitchTo(oldcontext);
+						PushActiveSnapshot(GetTransactionSnapshot());
+					}
+
+					break;
+				}
+			default:
+				/* Should not happen. */
+				elog(ERROR, "pg_shared_plans bug, unexpected reindex kind %d",
+						rdx->kind);
+				break;
+		}
+	}
+#endif
 }
 
 void
