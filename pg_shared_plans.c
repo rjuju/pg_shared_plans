@@ -56,6 +56,10 @@
 #include "include/pgsp_rdepend.h"
 #include "include/pgsp_utility.h"
 
+#if PG_VERSION_NUM < 170000
+#define hashRowType			hashTupleDesc
+#endif
+
 PG_MODULE_MAGIC;
 
 #define PGSP_TRANCHE_NAME		"pg_shared_plans"
@@ -219,6 +223,9 @@ dshash_parameters pgsp_rdepend_params = {
 	sizeof(pgspRdependEntry),
 	pgsp_rdepend_fn_compare,
 	pgsp_rdepend_fn_hash,
+#if PG_VERSION_NUM >= 170000
+	dshash_memcpy,
+#endif
 	-1, /* will be set at inittime */
 };
 
@@ -563,7 +570,7 @@ pgsp_planner_hook(Query *parse,
 		int			i;
 
 		desc = ExecCleanTypeFromTL(parse->targetList);
-		context.constid = hash_combine(context.constid, hashTupleDesc(desc));
+		context.constid = hash_combine(context.constid, hashRowType(desc));
 
 		/* We also need to take into account resname. */
 		for (i = 0; i < desc->natts; i++)
@@ -2217,6 +2224,9 @@ do_showplans(dsa_pointer plan)
 #if PG_VERSION_NUM >= 130000
 				   ,NULL
 #endif
+#if PG_VERSION_NUM >= 170000
+				   ,NULL
+#endif
 				   );
 	pgsp_acquire_executor_locks(stmt, false);
 
@@ -2362,7 +2372,10 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 		if (rentry == NULL)
 		{
 			LWLockRelease(pgsp->lock);
+#if PG_VERSION_NUM < 170000
+			/* Should be a no-op anyway. */
 			tuplestore_donestoring(tupstore);
+#endif
 			return (Datum) 0;
 		}
 
@@ -2498,6 +2511,9 @@ pg_shared_plans(PG_FUNCTION_ARGS)
 
 	/* clean up and return the tuplestore */
 	LWLockRelease(pgsp->lock);
+#if PG_VERSION_NUM < 170000
+			/* Should be a no-op anyway. */
 	tuplestore_donestoring(tupstore);
+#endif
 	return (Datum) 0;
 }
