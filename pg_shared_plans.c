@@ -1888,7 +1888,7 @@ pgsp_entry_dealloc(void)
 
 	for (i = 0; i < nvictims; i++)
 	{
-		pgspEntry *entry = entries[i];
+		entry = entries[i];
 
 		pgsp_entry_remove(entry);
 	}
