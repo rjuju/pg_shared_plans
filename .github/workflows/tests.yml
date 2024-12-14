@@ -1,0 +1,49 @@
+name: Build and run pg_shared_plans tests
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    strategy:
+      matrix:
+        pgversion:
+          - 12
+          - 13
+          - 14
+          - 15
+          - 16
+          - 17
+
+    env:
+      PGVERSION: ${{ matrix.pgversion }}
+
+    steps:
+    - name: checkout
+      uses: actions/checkout@v2
+
+    - name: install pg
+      run: |
+        sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -v $PGVERSION -p -i
+        sudo -u postgres createuser -s "$USER"
+
+    - name: build
+      run: |
+        make PROFILE="-Werror"
+        sudo -E make install
+
+    - name: test
+      run: |
+        sudo pg_conftool $PGVERSION main set shared_preload_libraries pg_stat_statements,pg_shared_plans
+        sudo service postgresql restart
+        make installcheck
+
+    - name: show regression diffs
+      if: ${{ failure() }}
+      run: |
+        cat regression.diffs
