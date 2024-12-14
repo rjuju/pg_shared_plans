@@ -538,10 +538,11 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 		RangeVar *rel = rdx->relation;
 #if PG_VERSION_NUM >= 120000
 		bool		concurrently = false;
+#if PG_VERSION_NUM >= 140000
 		ListCell   *lc;
-#endif
+#endif					/* pg14+ */
 
-#if PG_VERSION_NUM >= 120000
+#if PG_VERSION_NUM >= 140000
 		/* Figure out if CONCURRENTLY was specified. */
 		foreach(lc, rdx->params)
 		{
@@ -553,6 +554,9 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 				break;
 			}
 		}
+#else
+		concurrently = rdx->concurrent;
+#endif
 
 		/*
 		 * Don't mess  up with the transactions if the command is gonna
@@ -676,7 +680,7 @@ pgsp_utility_pre_exec(Node *parsetree, pgspUtilityContext *c)
 				break;
 		}
 	}
-#endif
+#endif					/* pg12+ */
 }
 
 void
