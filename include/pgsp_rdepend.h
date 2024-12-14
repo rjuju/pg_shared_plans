@@ -48,7 +48,9 @@ typedef struct pgspRdependEntry
 	dsa_pointer keys;		/* Hold an array of pgspHashKey */
 } pgspRdependEntry;
 
-extern dshash_parameters pgsp_rdepend_params;
+extern PGDLLIMPORT dshash_parameters pgsp_rdepend_params;
+extern PGDLLIMPORT int pgsp_rdepend_max;
+
 
 bool pgsp_entry_register_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key);
 void pgsp_entry_unregister_rdepend(Oid dbid, Oid classid, Oid oid, pgspHashKey *key);
